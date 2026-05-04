@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Experiment outputs (keep INDEX.md as the shared ledger)
+results/
+!results/
+!results/INDEX.md
+outputs/
+*.csv
+*.pt
+*.safetensors
+MATH500.json
+
+# Model / data caches
+.cache/
+hf_cache/
+
+# Secrets
+.env
+*.log
