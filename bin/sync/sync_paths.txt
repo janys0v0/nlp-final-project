@@ -1,0 +1,5 @@
+# Paths to rsync from the Prime pod to local host.
+# One entry per line, relative to the Prime pod root. Directories recurse.
+# Lines starting with `#` and blank lines are ignored.
+
+results/
