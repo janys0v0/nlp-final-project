@@ -256,25 +256,35 @@ def naive_temp(p, context, temp, seq_len):
     return prop, log_probs_norm, log_probs_unnorm
 
 
-def mcmc_power_samp(p, context, temp, mcmc_steps, max_new_tokens, block_num=16, local_moves=False):
+def mcmc_power_samp(p, context, temp, mcmc_steps, max_new_tokens, block_num=16, local_moves=False, local_window_blocks=1):
     c = len(context)
     print("alpha:", 1 / temp)
     gen = context.copy() if context is not None else []
     log_probs_norm = []
     log_probs_unnorm = []
     assert max_new_tokens % block_num == 0
+    assert local_window_blocks >= 1
+    assert not local_moves or local_window_blocks <= block_num
     jump_size = int(max_new_tokens // block_num)
-    print("max_new_tokens:", max_new_tokens, "jump_size:", jump_size, "local_moves:", local_moves)
+    effective_window_blocks = local_window_blocks if local_moves else block_num
+    recent_window_tokens = effective_window_blocks * jump_size
+    print("max_new_tokens:", max_new_tokens, "jump_size:", jump_size, "local_moves:", local_moves, "local_window_blocks:", local_window_blocks, "recent_window_tokens:", recent_window_tokens)
     attempts = 0
     acceptances = 0
-    for _ in tqdm(range(block_num)):
+    block_stats = []
+    for block_idx in tqdm(range(block_num)):
+        sync_cuda(p.device)
+        block_start = time.perf_counter()
+        block_attempts = 0
+        block_acceptances = 0
         gen, lp_norm, lp_unnorm = naive_temp(p, gen, temp=temp, seq_len=jump_size + len(gen))
         log_probs_norm.extend(lp_norm)
         log_probs_unnorm.extend(lp_unnorm)
         for _ in tqdm(range(mcmc_steps)):
             attempts += 1
+            block_attempts += 1
             t = len(gen)
-            lo = max(c, t - jump_size) if local_moves else c
+            lo = max(c, t - recent_window_tokens) if local_moves else c
             idx = random.randint(lo, t - 1)
             prop, log_prob_prop, target_log_prob_prop = naive_temp(p, gen[:idx], temp=temp, seq_len=t)
             s = len(prop)
@@ -290,16 +300,26 @@ def mcmc_power_samp(p, context, temp, mcmc_steps, max_new_tokens, block_num=16, 
             )
             if np.random.rand() < np.exp(log_r):
                 acceptances += 1
+                block_acceptances += 1
                 gen = prop.copy()
                 log_probs_norm[idx - c :] = log_prob_prop.copy()
                 log_probs_unnorm[idx - c :] = target_log_prob_prop.copy()
+        sync_cuda(p.device)
+        block_stats.append({
+            "block_idx": block_idx,
+            "block_attempts": block_attempts,
+            "block_acceptances": block_acceptances,
+            "block_acceptance_rate": block_acceptances / max(1, block_attempts),
+            "block_seconds": time.perf_counter() - block_start,
+            "recent_window_tokens": recent_window_tokens,
+        })
         if p.tokenizer.eos_token_id in gen[c:]:
             eos_idx = c + gen[c:].index(p.tokenizer.eos_token_id)
             gen = gen[: eos_idx + 1]
             log_probs_norm = log_probs_norm[: eos_idx - c + 1]
             log_probs_unnorm = log_probs_unnorm[: eos_idx - c + 1]
-            return gen, log_probs_norm, log_probs_unnorm, acceptances / max(1, attempts)
-    return gen, log_probs_norm, log_probs_unnorm, acceptances / max(1, attempts)
+            return gen, log_probs_norm, log_probs_unnorm, acceptances / max(1, attempts), block_stats
+    return gen, log_probs_norm, log_probs_unnorm, acceptances / max(1, attempts), block_stats
 
 
 def sync_cuda(device):
@@ -321,11 +341,21 @@ class PowerExperimentConfig:
     data_path: str = "MATH500.json"
     use_cot: bool = True
     local_moves: bool = True
+    local_window_blocks: int = 1
     include_baselines: bool = True
 
 
 def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     set_seed(config.seed)
+    if config.max_new_tokens % config.block_num != 0:
+        raise ValueError(f"max_new_tokens must be divisible by block_num: {config.max_new_tokens} % {config.block_num}")
+    if config.local_window_blocks < 1:
+        raise ValueError("local_window_blocks must be >= 1")
+    if config.local_moves and config.local_window_blocks > config.block_num:
+        raise ValueError("local_window_blocks cannot exceed block_num for local moves")
+    jump_size = config.max_new_tokens // config.block_num
+    effective_window_blocks = config.local_window_blocks if config.local_moves else config.block_num
+    recent_window_tokens = effective_window_blocks * jump_size
     data_path = ensure_math500(config.data_path)
     dataset = load_math500(data_path)
     start, end, shard = select_shard(dataset, config.batch_idx, config.max_problems)
@@ -423,7 +453,7 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
 
         sync_cuda(device)
         mcmc_start = time.perf_counter()
-        mcmc_output, _, _, acceptance_ratio = mcmc_power_samp(
+        mcmc_output, _, _, acceptance_ratio, block_stats = mcmc_power_samp(
             sampler,
             prefix,
             config.temperature,
@@ -431,6 +461,7 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
             max_new_tokens=config.max_new_tokens,
             block_num=config.block_num,
             local_moves=config.local_moves,
+            local_window_blocks=config.local_window_blocks,
         )
         sync_cuda(device)
         mcmc_seconds = time.perf_counter() - mcmc_start
@@ -438,6 +469,7 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
         mcmc_ids = mcmc_output[prompt_len:]
         mcmc_completion = tokenizer.decode(mcmc_ids, skip_special_tokens=True)
         mcmc_answer = parse_answer(mcmc_completion)
+        mcmc_hit_eos = tokenizer.eos_token_id in mcmc_ids
         row.update(
             {
                 "mcmc_completion": mcmc_completion,
@@ -449,6 +481,17 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
                 "mcmc_tokens_per_second": len(mcmc_ids) / max(mcmc_seconds, 1e-9),
                 "acceptance_ratio": acceptance_ratio,
                 "mcmc_local_moves": config.local_moves,
+                "mcmc_local_window_blocks": config.local_window_blocks,
+                "mcmc_effective_window_blocks": effective_window_blocks,
+                "mcmc_recent_window_tokens": recent_window_tokens,
+                "mcmc_block_num": config.block_num,
+                "mcmc_jump_size": jump_size,
+                "mcmc_hit_eos": mcmc_hit_eos,
+                "mcmc_truncated": not mcmc_hit_eos,
+                "mcmc_blocks_completed": len(block_stats),
+                "mcmc_block_acceptance_rates": json.dumps([b["block_acceptance_rate"] for b in block_stats]),
+                "mcmc_block_seconds": json.dumps([b["block_seconds"] for b in block_stats]),
+                "mcmc_block_recent_window_tokens": json.dumps([b["recent_window_tokens"] for b in block_stats]),
             }
         )
         results.append(row)
@@ -462,7 +505,7 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     df = pd.DataFrame(results)
     csv_name = (
         f"{config.model_key}_math_power_{experiment_name}_"
-        f"steps{config.mcmc_steps}_blocks{config.block_num}_temp{config.temperature}_"
+        f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
         f"batch{config.batch_idx}_seed{config.seed}.csv"
     )
     out_path = out_dir / csv_name
@@ -473,6 +516,7 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
         "mcmc_tokens_per_second",
         "mcmc_seconds",
         "mcmc_tokens",
+        "mcmc_recent_window_tokens",
     ]
     if config.include_baselines:
         metric_cols = [
