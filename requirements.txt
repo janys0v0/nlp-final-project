@@ -1,6 +1,11 @@
-accelerate
-numpy
-pandas
-torch
-tqdm
-transformers
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+torchaudio==2.4.1+cu121
+transformers==4.57.6
+accelerate==1.13.0
+tokenizers==0.22.2
+safetensors==0.7.0
+huggingface-hub==0.36.2
+numpy==1.26.3
+pandas==3.0.2
+tqdm==4.67.3
