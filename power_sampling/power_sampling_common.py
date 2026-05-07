@@ -379,6 +379,13 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     if torch.cuda.is_available():
         print(f"[diag] gpu={torch.cuda.get_device_name(0)} cuda={torch.version.cuda}")
 
+    csv_name = (
+        f"{config.model_key}_math_power_{experiment_name}_"
+        f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
+        f"batch{config.batch_idx}_seed{config.seed}.csv"
+    )
+    out_path = out_dir / csv_name
+
     results = []
     for data in tqdm(shard, desc=f"MATH {experiment_name} power sampling"):
         question = data["prompt"]
@@ -495,20 +502,18 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
             }
         )
         results.append(row)
+        # Checkpoint after every problem so partial progress survives crashes
+        # / pre-emptions and is visible to the rsync backup loop.
+        pd.DataFrame(results).to_csv(out_path, index=False)
         print(
             "acceptance_ratio:",
             acceptance_ratio,
             "mcmc_correct:",
             answers_match(mcmc_answer, answer),
+            f"checkpoint -> {out_path} ({len(results)}/{len(shard)})",
         )
 
     df = pd.DataFrame(results)
-    csv_name = (
-        f"{config.model_key}_math_power_{experiment_name}_"
-        f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
-        f"batch{config.batch_idx}_seed{config.seed}.csv"
-    )
-    out_path = out_dir / csv_name
     df.to_csv(out_path, index=False)
     metric_cols = [
         "mcmc_correct",
