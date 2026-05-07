@@ -731,11 +731,11 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
     target_vocab_size = model_vocab_size(target_model)
     draft_vocab_size = model_vocab_size(draft_model)
     tokenizer_size = len(tokenizer)
-    if target_vocab_size != draft_vocab_size:
-        raise ValueError(
-            "Target and draft vocab sizes differ; use models with the same tokenizer/vocabulary. "
-            f"target={target_vocab_size}, draft={draft_vocab_size}, tokenizer={tokenizer_size}"
-        )
+    # if target_vocab_size != draft_vocab_size:
+    #     raise ValueError(
+    #         "Target and draft vocab sizes differ; use models with the same tokenizer/vocabulary. "
+    #         f"target={target_vocab_size}, draft={draft_vocab_size}, tokenizer={tokenizer_size}"
+    #     )
     if tokenizer_size > min(target_vocab_size, draft_vocab_size):
         raise ValueError(
             "Tokenizer can emit ids outside at least one model embedding matrix. "
