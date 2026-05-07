@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
 import random
@@ -256,7 +257,7 @@ def naive_temp(p, context, temp, seq_len):
     return prop, log_probs_norm, log_probs_unnorm
 
 
-def mcmc_power_samp(p, context, temp, mcmc_steps, max_new_tokens, block_num=16, local_moves=False, local_window_blocks=1):
+def mcmc_power_samp(p, context, temp, mcmc_steps, max_new_tokens, block_num=16, local_moves=False, local_window_blocks=1, block_callback=None):
     c = len(context)
     print("alpha:", 1 / temp)
     gen = context.copy() if context is not None else []
@@ -313,6 +314,17 @@ def mcmc_power_samp(p, context, temp, mcmc_steps, max_new_tokens, block_num=16, 
             "block_seconds": time.perf_counter() - block_start,
             "recent_window_tokens": recent_window_tokens,
         })
+        if block_callback is not None:
+            block_callback(
+                {
+                    "block_idx": block_idx,
+                    "blocks_completed": len(block_stats),
+                    "block_stats": list(block_stats),
+                    "acceptance_ratio": acceptances / max(1, attempts),
+                    "tokens_generated": len(gen) - c,
+                    "current_tokens": list(gen),
+                }
+            )
         if p.tokenizer.eos_token_id in gen[c:]:
             eos_idx = c + gen[c:].index(p.tokenizer.eos_token_id)
             gen = gen[: eos_idx + 1]
@@ -345,6 +357,64 @@ class PowerExperimentConfig:
     include_baselines: bool = True
 
 
+class _ResultsWriter:
+    """Owns the in-memory results list and flushes the CSV after every change."""
+
+    def __init__(self, results, out_path):
+        self.results = results
+        self.out_path = out_path
+
+    def append_row(self, row):
+        self.results.append(row)
+        self.flush()
+        return len(self.results) - 1
+
+    def update_row(self, idx, **fields):
+        self.results[idx].update(fields)
+        self.flush()
+
+    def flush(self):
+        pd.DataFrame(self.results).to_csv(self.out_path, index=False)
+
+
+def _load_completed_rows(out_path, completion_col):
+    """Return the list of fully-completed row dicts already written to `out_path`.
+
+    Rows where `completion_col` is null (i.e. a problem was checkpointed mid-MCMC
+    when the previous run died) are dropped so they will be re-attempted from
+    scratch.
+    """
+    if not Path(out_path).exists():
+        return []
+    df = pd.read_csv(out_path)
+    if completion_col not in df.columns:
+        return []
+    completed = df[df[completion_col].notna()]
+    return completed.to_dict(orient="records")
+
+
+def _save_block_progress(state, *, writer, row_idx, tokenizer, prompt_len):
+    partial_completion = tokenizer.decode(
+        state["current_tokens"][prompt_len:], skip_special_tokens=True
+    )
+    writer.update_row(
+        row_idx,
+        mcmc_blocks_completed=state["blocks_completed"],
+        acceptance_ratio=state["acceptance_ratio"],
+        mcmc_completion_partial=partial_completion,
+        mcmc_tokens_partial=state["tokens_generated"],
+        mcmc_block_acceptance_rates=json.dumps(
+            [b["block_acceptance_rate"] for b in state["block_stats"]]
+        ),
+        mcmc_block_seconds=json.dumps(
+            [b["block_seconds"] for b in state["block_stats"]]
+        ),
+        mcmc_block_recent_window_tokens=json.dumps(
+            [b["recent_window_tokens"] for b in state["block_stats"]]
+        ),
+    )
+
+
 def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     set_seed(config.seed)
     if config.max_new_tokens % config.block_num != 0:
@@ -367,6 +437,28 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     out_dir = Path(config.save_dir) / config.model_key
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    csv_name = (
+        f"{config.model_key}_math_power_{experiment_name}_"
+        f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
+        f"batch{config.batch_idx}_seed{config.seed}.csv"
+    )
+    out_path = out_dir / csv_name
+
+    # Resume from any prior checkpoint at this exact path.
+    completed_rows = _load_completed_rows(out_path, completion_col="mcmc_completion")
+    start_from = len(completed_rows)
+    if start_from >= len(shard):
+        print(
+            f"[resume] all {len(shard)} problem(s) already complete in {out_path}; "
+            "nothing to do"
+        )
+        return out_path
+    if start_from:
+        print(
+            f"[resume] {out_path}: {start_from}/{len(shard)} problem(s) already complete; "
+            f"continuing with the remaining {len(shard) - start_from}"
+        )
+
     print("Loading tokenizer and model...")
     processor, tokenizer = load_text_processor(model_str)
     hf_model = load_generation_model(model_str)
@@ -379,8 +471,10 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     if torch.cuda.is_available():
         print(f"[diag] gpu={torch.cuda.get_device_name(0)} cuda={torch.version.cuda}")
 
-    results = []
-    for data in tqdm(shard, desc=f"MATH {experiment_name} power sampling"):
+    results = list(completed_rows)
+    writer = _ResultsWriter(results, out_path)
+
+    for data in tqdm(shard[start_from:], desc=f"MATH {experiment_name} power sampling"):
         question = data["prompt"]
         answer = data["answer"]
         input_text = format_prompt(question, config.model_key, tokenizer, config.use_cot)
@@ -451,6 +545,29 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
                 }
             )
 
+        # Append the partial row now so baselines (and per-block MCMC progress)
+        # are checkpointed to disk before MCMC even finishes.
+        row.update(
+            {
+                "mcmc_local_moves": config.local_moves,
+                "mcmc_local_window_blocks": config.local_window_blocks,
+                "mcmc_effective_window_blocks": effective_window_blocks,
+                "mcmc_recent_window_tokens": recent_window_tokens,
+                "mcmc_block_num": config.block_num,
+                "mcmc_jump_size": jump_size,
+                "mcmc_blocks_completed": 0,
+            }
+        )
+        row_idx = writer.append_row(row)
+
+        block_callback = functools.partial(
+            _save_block_progress,
+            writer=writer,
+            row_idx=row_idx,
+            tokenizer=tokenizer,
+            prompt_len=prompt_len,
+        )
+
         sync_cuda(device)
         mcmc_start = time.perf_counter()
         mcmc_output, _, _, acceptance_ratio, block_stats = mcmc_power_samp(
@@ -462,6 +579,7 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
             block_num=config.block_num,
             local_moves=config.local_moves,
             local_window_blocks=config.local_window_blocks,
+            block_callback=block_callback,
         )
         sync_cuda(device)
         mcmc_seconds = time.perf_counter() - mcmc_start
@@ -470,45 +588,36 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
         mcmc_completion = tokenizer.decode(mcmc_ids, skip_special_tokens=True)
         mcmc_answer = parse_answer(mcmc_completion)
         mcmc_hit_eos = tokenizer.eos_token_id in mcmc_ids
-        row.update(
-            {
-                "mcmc_completion": mcmc_completion,
-                "mcmc_answer": mcmc_answer,
-                "mcmc_answer_normalized": normalize_math_answer(mcmc_answer),
-                "mcmc_correct": answers_match(mcmc_answer, answer),
-                "mcmc_tokens": len(mcmc_ids),
-                "mcmc_seconds": mcmc_seconds,
-                "mcmc_tokens_per_second": len(mcmc_ids) / max(mcmc_seconds, 1e-9),
-                "acceptance_ratio": acceptance_ratio,
-                "mcmc_local_moves": config.local_moves,
-                "mcmc_local_window_blocks": config.local_window_blocks,
-                "mcmc_effective_window_blocks": effective_window_blocks,
-                "mcmc_recent_window_tokens": recent_window_tokens,
-                "mcmc_block_num": config.block_num,
-                "mcmc_jump_size": jump_size,
-                "mcmc_hit_eos": mcmc_hit_eos,
-                "mcmc_truncated": not mcmc_hit_eos,
-                "mcmc_blocks_completed": len(block_stats),
-                "mcmc_block_acceptance_rates": json.dumps([b["block_acceptance_rate"] for b in block_stats]),
-                "mcmc_block_seconds": json.dumps([b["block_seconds"] for b in block_stats]),
-                "mcmc_block_recent_window_tokens": json.dumps([b["recent_window_tokens"] for b in block_stats]),
-            }
+        writer.update_row(
+            row_idx,
+            mcmc_completion=mcmc_completion,
+            mcmc_answer=mcmc_answer,
+            mcmc_answer_normalized=normalize_math_answer(mcmc_answer),
+            mcmc_correct=answers_match(mcmc_answer, answer),
+            mcmc_tokens=len(mcmc_ids),
+            mcmc_seconds=mcmc_seconds,
+            mcmc_tokens_per_second=len(mcmc_ids) / max(mcmc_seconds, 1e-9),
+            acceptance_ratio=acceptance_ratio,
+            mcmc_hit_eos=mcmc_hit_eos,
+            mcmc_truncated=not mcmc_hit_eos,
+            mcmc_blocks_completed=len(block_stats),
+            mcmc_block_acceptance_rates=json.dumps(
+                [b["block_acceptance_rate"] for b in block_stats]
+            ),
+            mcmc_block_seconds=json.dumps([b["block_seconds"] for b in block_stats]),
+            mcmc_block_recent_window_tokens=json.dumps(
+                [b["recent_window_tokens"] for b in block_stats]
+            ),
         )
-        results.append(row)
         print(
             "acceptance_ratio:",
             acceptance_ratio,
             "mcmc_correct:",
             answers_match(mcmc_answer, answer),
+            f"checkpoint -> {out_path} ({len(results)}/{len(shard)})",
         )
 
     df = pd.DataFrame(results)
-    csv_name = (
-        f"{config.model_key}_math_power_{experiment_name}_"
-        f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
-        f"batch{config.batch_idx}_seed{config.seed}.csv"
-    )
-    out_path = out_dir / csv_name
     df.to_csv(out_path, index=False)
     metric_cols = [
         "mcmc_correct",
@@ -711,6 +820,27 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
     out_dir = Path(config.save_dir) / "speculative_power"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    csv_name = (
+        f"spec_power_{config.draft_model_key}_to_{config.target_model_key}_"
+        f"alpha{config.alpha}_block{config.block_size}_steps{config.mcmc_steps_per_block}_"
+        f"batch{config.batch_idx}_seed{config.seed}.csv"
+    )
+    out_path = out_dir / csv_name
+
+    completed_rows = _load_completed_rows(out_path, completion_col="spec_completion")
+    start_from = len(completed_rows)
+    if start_from >= len(shard):
+        print(
+            f"[resume] all {len(shard)} problem(s) already complete in {out_path}; "
+            "nothing to do"
+        )
+        return out_path
+    if start_from:
+        print(
+            f"[resume] {out_path}: {start_from}/{len(shard)} problem(s) already complete; "
+            f"continuing with the remaining {len(shard) - start_from}"
+        )
+
     print("Loading shared tokenizer...")
     processor, tokenizer = load_text_processor(target_model_str)
 
@@ -738,8 +868,10 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
         )
     print("Models loaded.")
 
-    results = []
-    for data in tqdm(shard, desc="MATH speculative power"):
+    results = list(completed_rows)
+    writer = _ResultsWriter(results, out_path)
+
+    for data in tqdm(shard[start_from:], desc="MATH speculative power"):
         question = data["prompt"]
         answer = data["answer"]
         input_text = format_prompt(question, config.target_model_key, tokenizer, config.use_cot)
@@ -764,7 +896,7 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
 
         completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
         predicted_answer = parse_answer(completion)
-        results.append(
+        writer.append_row(
             {
                 "question": question,
                 "correct_answer": answer,
@@ -788,15 +920,10 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
             answers_match(predicted_answer, answer),
             "tokens/sec:",
             len(generated_ids) / max(seconds, 1e-9),
+            f"checkpoint -> {out_path} ({len(results)}/{len(shard)})",
         )
 
     df = pd.DataFrame(results)
-    csv_name = (
-        f"spec_power_{config.draft_model_key}_to_{config.target_model_key}_"
-        f"alpha{config.alpha}_block{config.block_size}_steps{config.mcmc_steps_per_block}_"
-        f"batch{config.batch_idx}_seed{config.seed}.csv"
-    )
-    out_path = out_dir / csv_name
     df.to_csv(out_path, index=False)
     metric_cols = [
         "spec_correct",
