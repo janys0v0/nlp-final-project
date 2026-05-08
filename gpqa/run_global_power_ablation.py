@@ -33,7 +33,6 @@ def main():
     args = parse_args()
     config = PowerExperimentConfig(
         model_key=args.model_key,
-        batch_idx=args.batch_idx,
         seed=args.seed,
         mcmc_steps=args.mcmc_steps,
         temperature=args.temperature,
