@@ -161,8 +161,15 @@ def ensure_math500(path, repo="aakaran/reasoning-with-sampling", ref="main"):
 
 
 def load_math500(path):
-    with open(path, "r") as f:
-        return json.load(f)
+    path = Path(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Could not parse MATH500 JSON file: {path}. "
+            "If this is a GPQA data file, pass --dataset gpqa."
+        ) from exc
 
 
 def load_gpqa(path):

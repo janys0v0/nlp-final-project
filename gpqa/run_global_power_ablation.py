@@ -7,7 +7,7 @@ MCMC_LOCAL_MOVES = False
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Global power-sampling ablation on MATH500.")
+    parser = argparse.ArgumentParser(description="Global power-sampling ablation on MATH500 or GPQA.")
     parser.add_argument("--model-key", default="qwen3_8b")
     parser.add_argument("--dataset", choices=("math", "gpqa"), default="math")
 
@@ -33,6 +33,7 @@ def main():
     args = parse_args()
     config = PowerExperimentConfig(
         model_key=args.model_key,
+        dataset=args.dataset,
         seed=args.seed,
         mcmc_steps=args.mcmc_steps,
         temperature=args.temperature,
