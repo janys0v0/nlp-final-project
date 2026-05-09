@@ -8,32 +8,35 @@ from tqdm.auto import tqdm
 
 from power_sampling_common import (
     MODEL_REPOS,
-    answers_match,
+    benchmark_answers_match,
     encode_text_prompt,
-    ensure_math500,
-    format_prompt,
     infer_model_device,
+    load_benchmark_dataset,
     load_generation_model,
-    load_math500,
     load_text_processor,
-    normalize_math_answer,
-    parse_answer,
-    select_shard,
+    normalize_benchmark_answer,
+    parse_benchmark_answer,
+    prepare_benchmark_example,
+    select_examples,
     set_seed,
     sync_cuda,
 )
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Base-model-only generation on MATH500.")
+    parser = argparse.ArgumentParser(description="Base-model-only generation on MATH500 or GPQA.")
+    parser.add_argument("--dataset", choices=("math", "gpqa"), default="math")
     parser.add_argument("--model-key", default="qwen3_8b")
-    parser.add_argument("--batch-idx", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.25)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--max-problems", type=int, default=10)
     parser.add_argument("--save-dir", default="results")
-    parser.add_argument("--data-path", default="MATH500.json")
+    parser.add_argument(
+        "--data-path",
+        default=None,
+        help="Benchmark data path. Defaults to MATH500.json for math and GPQA.jsonl for gpqa.",
+    )
     parser.add_argument("--no-cot", action="store_true")
     return parser.parse_args()
 
@@ -41,14 +44,14 @@ def parse_args():
 def main():
     args = parse_args()
     set_seed(args.seed)
+    dataset_name = args.dataset.lower()
 
-    data_path = ensure_math500(args.data_path)
-    dataset = load_math500(data_path)
-    start, end, shard = select_shard(dataset, args.batch_idx, args.max_problems)
+    data_path, dataset = load_benchmark_dataset(dataset_name, args.data_path)
+    start, end, shard = select_examples(dataset, args.max_problems)
 
     model_str = MODEL_REPOS[args.model_key]
     device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"shard [{start}, {end}) of MATH500, model={model_str} device={device_name}")
+    print(f"examples [{start}, {end}) of {dataset_name.upper()}, model={model_str} device={device_name} data={data_path}")
     print("Loading tokenizer and model...")
     processor, tokenizer = load_text_processor(model_str)
     hf_model = load_generation_model(model_str)
@@ -62,10 +65,19 @@ def main():
 
     do_sample = args.temperature > 0
     results = []
-    for data in tqdm(shard, desc="MATH base model"):
-        question = data["prompt"]
-        answer = data["answer"]
-        input_text = format_prompt(question, args.model_key, tokenizer, not args.no_cot)
+    for problem_idx, data in tqdm(
+        enumerate(shard, start=start),
+        total=len(shard),
+        desc=f"{dataset_name.upper()} base model",
+    ):
+        question, answer, input_text = prepare_benchmark_example(
+            dataset_name,
+            data,
+            args.model_key,
+            tokenizer,
+            not args.no_cot,
+            example_seed=args.seed + problem_idx,
+        )
         model_inputs = encode_text_prompt(processor, tokenizer, input_text, device)
         prompt_len = model_inputs["input_ids"].shape[1]
 
@@ -88,15 +100,16 @@ def main():
 
         output_ids = output.sequences[0, prompt_len:].to("cpu")
         completion = tokenizer.decode(output_ids, skip_special_tokens=True)
-        parsed_answer = parse_answer(completion)
-        normalized_answer = normalize_math_answer(parsed_answer)
-        correct = answers_match(parsed_answer, answer)
+        parsed_answer = parse_benchmark_answer(dataset_name, completion)
+        normalized_answer = normalize_benchmark_answer(dataset_name, parsed_answer)
+        correct = benchmark_answers_match(dataset_name, parsed_answer, answer)
         hit_eos = tokenizer.eos_token_id in output_ids.tolist()
 
         row = {
+            "dataset": dataset_name,
             "question": question,
             "correct_answer": answer,
-            "correct_answer_normalized": normalize_math_answer(answer),
+            "correct_answer_normalized": normalize_benchmark_answer(dataset_name, answer),
             "base_completion": completion,
             "base_answer": parsed_answer,
             "base_answer_normalized": normalized_answer,
@@ -123,7 +136,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = (
         out_dir
-        / f"{args.model_key}_math_base_temp{args.temperature}_batch{args.batch_idx}_seed{args.seed}.csv"
+        / f"{args.model_key}_{dataset_name}_base_temp{args.temperature}_n{len(shard)}_seed{args.seed}.csv"
     )
     pd.DataFrame(results).to_csv(out_path, index=False)
     print("Saved:", out_path)

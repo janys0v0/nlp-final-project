@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -19,6 +20,11 @@ from tqdm.auto import tqdm
 PROMPT = "Can you solve the following math problem? "
 BASE = " Put your final answer within \\boxed{{}}."
 COT = " Please reason step by step, and put your final answer within \\boxed{{}}."
+GPQA_QUERY_TEMPLATE = (
+    "Answer the following multiple choice question. The last line of your response should be of the following "
+    "format: '\\boxed{{$LETTER}}' (without quotes) where LETTER is one of ABCD (ex. '\\boxed{{A}}'). Think step by "
+    "step before answering.\n\n{Question}\n\nA) {A}\nB) {B}\nC) {C}\nD) {D}"
+)
 
 MODEL_REPOS = {
     "qwen": "Qwen/Qwen2.5-7B",
@@ -100,6 +106,42 @@ def answers_match(prediction, target):
     return pred_norm is not None and target_norm is not None and pred_norm == target_norm
 
 
+def parse_gpqa_answer(input_str):
+    boxed = parse_answer(input_str or "")
+    text = boxed if boxed is not None else input_str or ""
+    matches = re.findall(r"\b(A|B|C|D)\b", str(text).upper())
+    return matches[-1] if matches else None
+
+
+def normalize_gpqa_answer(answer):
+    if answer is None:
+        return None
+    matches = re.findall(r"\b(A|B|C|D)\b", str(answer).upper())
+    return matches[-1] if matches else None
+
+
+def normalize_benchmark_answer(dataset_name, answer):
+    if dataset_name == "math":
+        return normalize_math_answer(answer)
+    if dataset_name == "gpqa":
+        return normalize_gpqa_answer(answer)
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+
+def parse_benchmark_answer(dataset_name, completion):
+    if dataset_name == "math":
+        return parse_answer(completion)
+    if dataset_name == "gpqa":
+        return parse_gpqa_answer(completion)
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+
+def benchmark_answers_match(dataset_name, prediction, target):
+    pred_norm = normalize_benchmark_answer(dataset_name, prediction)
+    target_norm = normalize_benchmark_answer(dataset_name, target)
+    return pred_norm is not None and target_norm is not None and pred_norm == target_norm
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -119,8 +161,32 @@ def ensure_math500(path, repo="aakaran/reasoning-with-sampling", ref="main"):
 
 
 def load_math500(path):
-    with open(path, "r") as f:
-        return json.load(f)
+    path = Path(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Could not parse MATH500 JSON file: {path}. "
+            "If this is a GPQA data file, pass --dataset gpqa."
+        ) from exc
+
+
+def load_gpqa(path):
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"GPQA data file not found: {path}. Pass --data-path pointing to a GPQA .jsonl, .json, or .csv file."
+        )
+    if path.suffix == ".jsonl":
+        with open(path, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    if path.suffix == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if path.suffix == ".csv":
+        return pd.read_csv(path).to_dict("records")
+    raise ValueError(f"Unsupported GPQA data file extension: {path.suffix}")
 
 
 def select_shard(dataset, batch_idx, max_problems, shard_size=100):
@@ -129,6 +195,29 @@ def select_shard(dataset, batch_idx, max_problems, shard_size=100):
     if max_problems is not None:
         end = min(start + int(max_problems), end)
     return start, end, dataset[start:end]
+
+
+def select_examples(dataset, max_problems):
+    end = len(dataset) if max_problems is None else min(int(max_problems), len(dataset))
+    return 0, end, dataset[:end]
+
+
+def default_data_path(dataset_name):
+    if dataset_name == "math":
+        return "MATH500.json"
+    if dataset_name == "gpqa":
+        return "GPQA.jsonl"
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+
+def load_benchmark_dataset(dataset_name, data_path):
+    data_path = data_path or default_data_path(dataset_name)
+    if dataset_name == "math":
+        data_path = ensure_math500(data_path)
+        return data_path, load_math500(data_path)
+    if dataset_name == "gpqa":
+        return Path(data_path), load_gpqa(data_path)
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 def load_text_processor(model_str):
@@ -198,6 +287,38 @@ def format_prompt(question, model_key, tokenizer, cot=True):
     else:
         raise ValueError(f"Unsupported model key for format_prompt: {model_key}")
     return format_str
+
+
+def format_gpqa_prompt(data, seed):
+    rng = random.Random(seed)
+    choices = [
+        data["Incorrect Answer 1"],
+        data["Incorrect Answer 2"],
+        data["Incorrect Answer 3"],
+    ]
+    rng.shuffle(choices)
+    gold_index = rng.randint(0, 3)
+    choices.insert(gold_index, data["Correct Answer"])
+    prompt = GPQA_QUERY_TEMPLATE.format(
+        A=choices[0],
+        B=choices[1],
+        C=choices[2],
+        D=choices[3],
+        Question=data["Question"],
+    )
+    return prompt, "ABCD"[gold_index]
+
+
+def prepare_benchmark_example(dataset_name, data, model_key, tokenizer, use_cot, example_seed):
+    if dataset_name == "math":
+        question = data["prompt"]
+        answer = data["answer"]
+        input_text = format_prompt(question, model_key, tokenizer, use_cot)
+        return question, answer, input_text
+    if dataset_name == "gpqa":
+        input_text, answer = format_gpqa_prompt(data, example_seed)
+        return input_text, answer, input_text
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 class AutoregressiveSampler:
