@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -19,6 +20,11 @@ from tqdm.auto import tqdm
 PROMPT = "Can you solve the following math problem? "
 BASE = " Put your final answer within \\boxed{{}}."
 COT = " Please reason step by step, and put your final answer within \\boxed{{}}."
+GPQA_QUERY_TEMPLATE = (
+    "Answer the following multiple choice question. The last line of your response should be of the following "
+    "format: '\\boxed{{$LETTER}}' (without quotes) where LETTER is one of ABCD (ex. '\\boxed{{A}}'). Think step by "
+    "step before answering.\n\n{Question}\n\nA) {A}\nB) {B}\nC) {C}\nD) {D}"
+)
 
 MODEL_REPOS = {
     "qwen": "Qwen/Qwen2.5-7B",
@@ -100,6 +106,42 @@ def answers_match(prediction, target):
     return pred_norm is not None and target_norm is not None and pred_norm == target_norm
 
 
+def parse_gpqa_answer(input_str):
+    boxed = parse_answer(input_str or "")
+    text = boxed if boxed is not None else input_str or ""
+    matches = re.findall(r"\b(A|B|C|D)\b", str(text).upper())
+    return matches[-1] if matches else None
+
+
+def normalize_gpqa_answer(answer):
+    if answer is None:
+        return None
+    matches = re.findall(r"\b(A|B|C|D)\b", str(answer).upper())
+    return matches[-1] if matches else None
+
+
+def normalize_benchmark_answer(dataset_name, answer):
+    if dataset_name == "math":
+        return normalize_math_answer(answer)
+    if dataset_name == "gpqa":
+        return normalize_gpqa_answer(answer)
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+
+def parse_benchmark_answer(dataset_name, completion):
+    if dataset_name == "math":
+        return parse_answer(completion)
+    if dataset_name == "gpqa":
+        return parse_gpqa_answer(completion)
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+
+def benchmark_answers_match(dataset_name, prediction, target):
+    pred_norm = normalize_benchmark_answer(dataset_name, prediction)
+    target_norm = normalize_benchmark_answer(dataset_name, target)
+    return pred_norm is not None and target_norm is not None and pred_norm == target_norm
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -119,8 +161,32 @@ def ensure_math500(path, repo="aakaran/reasoning-with-sampling", ref="main"):
 
 
 def load_math500(path):
-    with open(path, "r") as f:
-        return json.load(f)
+    path = Path(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Could not parse MATH500 JSON file: {path}. "
+            "If this is a GPQA data file, pass --dataset gpqa."
+        ) from exc
+
+
+def load_gpqa(path):
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"GPQA data file not found: {path}. Pass --data-path pointing to a GPQA .jsonl, .json, or .csv file."
+        )
+    if path.suffix == ".jsonl":
+        with open(path, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    if path.suffix == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if path.suffix == ".csv":
+        return pd.read_csv(path).to_dict("records")
+    raise ValueError(f"Unsupported GPQA data file extension: {path.suffix}")
 
 
 def select_shard(dataset, batch_idx, max_problems, shard_size=100):
@@ -129,6 +195,24 @@ def select_shard(dataset, batch_idx, max_problems, shard_size=100):
     if max_problems is not None:
         end = min(start + int(max_problems), end)
     return start, end, dataset[start:end]
+
+
+def default_data_path(dataset_name):
+    if dataset_name == "math":
+        return "MATH500.json"
+    if dataset_name == "gpqa":
+        return "GPQA.jsonl"
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+
+def load_benchmark_dataset(dataset_name, data_path):
+    data_path = data_path or default_data_path(dataset_name)
+    if dataset_name == "math":
+        data_path = ensure_math500(data_path)
+        return data_path, load_math500(data_path), 100
+    if dataset_name == "gpqa":
+        return Path(data_path), load_gpqa(data_path), 33
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 def load_text_processor(model_str):
@@ -198,6 +282,38 @@ def format_prompt(question, model_key, tokenizer, cot=True):
     else:
         raise ValueError(f"Unsupported model key for format_prompt: {model_key}")
     return format_str
+
+
+def format_gpqa_prompt(data, seed):
+    rng = random.Random(seed)
+    choices = [
+        data["Incorrect Answer 1"],
+        data["Incorrect Answer 2"],
+        data["Incorrect Answer 3"],
+    ]
+    rng.shuffle(choices)
+    gold_index = rng.randint(0, 3)
+    choices.insert(gold_index, data["Correct Answer"])
+    prompt = GPQA_QUERY_TEMPLATE.format(
+        A=choices[0],
+        B=choices[1],
+        C=choices[2],
+        D=choices[3],
+        Question=data["Question"],
+    )
+    return prompt, "ABCD"[gold_index]
+
+
+def prepare_benchmark_example(dataset_name, data, model_key, tokenizer, use_cot, example_seed):
+    if dataset_name == "math":
+        question = data["prompt"]
+        answer = data["answer"]
+        input_text = format_prompt(question, model_key, tokenizer, use_cot)
+        return question, answer, input_text
+    if dataset_name == "gpqa":
+        input_text, answer = format_gpqa_prompt(data, example_seed)
+        return input_text, answer, input_text
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 class AutoregressiveSampler:
@@ -330,6 +446,7 @@ def sync_cuda(device):
 @dataclass
 class PowerExperimentConfig:
     model_key: str = "qwen3_8b"
+    dataset: str = "math"
     batch_idx: int = 0
     seed: int = 0
     mcmc_steps: int = 4
@@ -338,7 +455,7 @@ class PowerExperimentConfig:
     block_num: int = 16
     max_problems: int | None = 10
     save_dir: str = "results"
-    data_path: str = "MATH500.json"
+    data_path: str | None = None
     use_cot: bool = True
     local_moves: bool = True
     local_window_blocks: int = 1
@@ -347,6 +464,9 @@ class PowerExperimentConfig:
 
 def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     set_seed(config.seed)
+    dataset_name = config.dataset.lower()
+    if dataset_name not in ("math", "gpqa"):
+        raise ValueError(f"Unsupported dataset: {config.dataset}")
     if config.max_new_tokens % config.block_num != 0:
         raise ValueError(f"max_new_tokens must be divisible by block_num: {config.max_new_tokens} % {config.block_num}")
     if config.local_window_blocks < 1:
@@ -356,13 +476,12 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     jump_size = config.max_new_tokens // config.block_num
     effective_window_blocks = config.local_window_blocks if config.local_moves else config.block_num
     recent_window_tokens = effective_window_blocks * jump_size
-    data_path = ensure_math500(config.data_path)
-    dataset = load_math500(data_path)
-    start, end, shard = select_shard(dataset, config.batch_idx, config.max_problems)
+    data_path, dataset, shard_size = load_benchmark_dataset(dataset_name, config.data_path)
+    start, end, shard = select_shard(dataset, config.batch_idx, config.max_problems, shard_size=shard_size)
 
     model_str = MODEL_REPOS[config.model_key]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"shard [{start}, {end}) of MATH500, model={model_str} device={device}")
+    print(f"shard [{start}, {end}) of {dataset_name.upper()}, model={model_str} device={device} data={data_path}")
 
     out_dir = Path(config.save_dir) / config.model_key
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -380,19 +499,29 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
         print(f"[diag] gpu={torch.cuda.get_device_name(0)} cuda={torch.version.cuda}")
 
     results = []
-    for data in tqdm(shard, desc=f"MATH {experiment_name} power sampling"):
-        question = data["prompt"]
-        answer = data["answer"]
-        input_text = format_prompt(question, config.model_key, tokenizer, config.use_cot)
+    for problem_idx, data in tqdm(
+        enumerate(shard, start=start),
+        total=len(shard),
+        desc=f"{dataset_name.upper()} {experiment_name} power sampling",
+    ):
+        question, answer, input_text = prepare_benchmark_example(
+            dataset_name,
+            data,
+            config.model_key,
+            tokenizer,
+            config.use_cot,
+            example_seed=config.seed + problem_idx,
+        )
         model_inputs = encode_text_prompt(processor, tokenizer, input_text, device)
         input_ids = model_inputs["input_ids"]
         prompt_len = input_ids.shape[1]
         prefix = [idx.item() for idx in input_ids[0]]
 
         row = {
+            "dataset": dataset_name,
             "question": question,
             "correct_answer": answer,
-            "correct_answer_normalized": normalize_math_answer(answer),
+            "correct_answer_normalized": normalize_benchmark_answer(dataset_name, answer),
         }
 
         if config.include_baselines:
@@ -429,22 +558,22 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
             std_ids = std_output.sequences[0, prompt_len:].to("cpu")
             naive_completion = tokenizer.decode(naive_ids, skip_special_tokens=True)
             std_completion = tokenizer.decode(std_ids, skip_special_tokens=True)
-            naive_answer = parse_answer(naive_completion)
-            std_answer = parse_answer(std_completion)
+            naive_answer = parse_benchmark_answer(dataset_name, naive_completion)
+            std_answer = parse_benchmark_answer(dataset_name, std_completion)
 
             row.update(
                 {
                     "naive_completion": naive_completion,
                     "naive_answer": naive_answer,
-                    "naive_answer_normalized": normalize_math_answer(naive_answer),
-                    "naive_correct": answers_match(naive_answer, answer),
+                    "naive_answer_normalized": normalize_benchmark_answer(dataset_name, naive_answer),
+                    "naive_correct": benchmark_answers_match(dataset_name, naive_answer, answer),
                     "naive_tokens": len(naive_ids),
                     "naive_seconds": naive_seconds,
                     "naive_tokens_per_second": len(naive_ids) / max(naive_seconds, 1e-9),
                     "std_completion": std_completion,
                     "std_answer": std_answer,
-                    "std_answer_normalized": normalize_math_answer(std_answer),
-                    "std_correct": answers_match(std_answer, answer),
+                    "std_answer_normalized": normalize_benchmark_answer(dataset_name, std_answer),
+                    "std_correct": benchmark_answers_match(dataset_name, std_answer, answer),
                     "std_tokens": len(std_ids),
                     "std_seconds": std_seconds,
                     "std_tokens_per_second": len(std_ids) / max(std_seconds, 1e-9),
@@ -468,14 +597,14 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
 
         mcmc_ids = mcmc_output[prompt_len:]
         mcmc_completion = tokenizer.decode(mcmc_ids, skip_special_tokens=True)
-        mcmc_answer = parse_answer(mcmc_completion)
+        mcmc_answer = parse_benchmark_answer(dataset_name, mcmc_completion)
         mcmc_hit_eos = tokenizer.eos_token_id in mcmc_ids
         row.update(
             {
                 "mcmc_completion": mcmc_completion,
                 "mcmc_answer": mcmc_answer,
-                "mcmc_answer_normalized": normalize_math_answer(mcmc_answer),
-                "mcmc_correct": answers_match(mcmc_answer, answer),
+                "mcmc_answer_normalized": normalize_benchmark_answer(dataset_name, mcmc_answer),
+                "mcmc_correct": benchmark_answers_match(dataset_name, mcmc_answer, answer),
                 "mcmc_tokens": len(mcmc_ids),
                 "mcmc_seconds": mcmc_seconds,
                 "mcmc_tokens_per_second": len(mcmc_ids) / max(mcmc_seconds, 1e-9),
@@ -499,12 +628,12 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
             "acceptance_ratio:",
             acceptance_ratio,
             "mcmc_correct:",
-            answers_match(mcmc_answer, answer),
+            benchmark_answers_match(dataset_name, mcmc_answer, answer),
         )
 
     df = pd.DataFrame(results)
     csv_name = (
-        f"{config.model_key}_math_power_{experiment_name}_"
+        f"{config.model_key}_{dataset_name}_power_{experiment_name}_"
         f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
         f"batch{config.batch_idx}_seed{config.seed}.csv"
     )
@@ -684,6 +813,7 @@ def run_speculative_power_sampling(
 class SpeculativeExperimentConfig:
     target_model_key: str = "qwen3_8b"
     draft_model_key: str = "qwen3_small"
+    dataset: str = "math"
     batch_idx: int = 0
     seed: int = 0
     alpha: float = 4.0
@@ -693,20 +823,25 @@ class SpeculativeExperimentConfig:
     draft_temperature: float = 1.0
     max_problems: int | None = 10
     save_dir: str = "results"
-    data_path: str = "MATH500.json"
+    data_path: str | None = None
     use_cot: bool = True
 
 
 def run_speculative_experiment(config: SpeculativeExperimentConfig):
     set_seed(config.seed)
-    data_path = ensure_math500(config.data_path)
-    dataset = load_math500(data_path)
-    start, end, shard = select_shard(dataset, config.batch_idx, config.max_problems)
+    dataset_name = config.dataset.lower()
+    if dataset_name not in ("math", "gpqa"):
+        raise ValueError(f"Unsupported dataset: {config.dataset}")
+    data_path, dataset, shard_size = load_benchmark_dataset(dataset_name, config.data_path)
+    start, end, shard = select_shard(dataset, config.batch_idx, config.max_problems, shard_size=shard_size)
 
     target_model_str = MODEL_REPOS[config.target_model_key]
     draft_model_str = MODEL_REPOS[config.draft_model_key]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"spec shard [{start}, {end}) target={target_model_str} draft={draft_model_str} device={device}")
+    print(
+        f"spec shard [{start}, {end}) of {dataset_name.upper()} "
+        f"target={target_model_str} draft={draft_model_str} device={device} data={data_path}"
+    )
 
     out_dir = Path(config.save_dir) / "speculative_power"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -726,11 +861,7 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
     target_vocab_size = model_vocab_size(target_model)
     draft_vocab_size = model_vocab_size(draft_model)
     tokenizer_size = len(tokenizer)
-    if target_vocab_size != draft_vocab_size:
-        raise ValueError(
-            "Target and draft vocab sizes differ; use models with the same tokenizer/vocabulary. "
-            f"target={target_vocab_size}, draft={draft_vocab_size}, tokenizer={tokenizer_size}"
-        )
+
     if tokenizer_size > min(target_vocab_size, draft_vocab_size):
         raise ValueError(
             "Tokenizer can emit ids outside at least one model embedding matrix. "
@@ -739,10 +870,19 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
     print("Models loaded.")
 
     results = []
-    for data in tqdm(shard, desc="MATH speculative power"):
-        question = data["prompt"]
-        answer = data["answer"]
-        input_text = format_prompt(question, config.target_model_key, tokenizer, config.use_cot)
+    for problem_idx, data in tqdm(
+        enumerate(shard, start=start),
+        total=len(shard),
+        desc=f"{dataset_name.upper()} speculative power",
+    ):
+        question, answer, input_text = prepare_benchmark_example(
+            dataset_name,
+            data,
+            config.target_model_key,
+            tokenizer,
+            config.use_cot,
+            example_seed=config.seed + problem_idx,
+        )
         model_inputs = encode_text_prompt(processor, tokenizer, input_text, device)
         context_ids = model_inputs["input_ids"]
 
@@ -763,16 +903,17 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
         seconds = time.perf_counter() - t0
 
         completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        predicted_answer = parse_answer(completion)
+        predicted_answer = parse_benchmark_answer(dataset_name, completion)
         results.append(
             {
+                "dataset": dataset_name,
                 "question": question,
                 "correct_answer": answer,
-                "correct_answer_normalized": normalize_math_answer(answer),
+                "correct_answer_normalized": normalize_benchmark_answer(dataset_name, answer),
                 "spec_completion": completion,
                 "spec_answer": predicted_answer,
-                "spec_answer_normalized": normalize_math_answer(predicted_answer),
-                "spec_correct": answers_match(predicted_answer, answer),
+                "spec_answer_normalized": normalize_benchmark_answer(dataset_name, predicted_answer),
+                "spec_correct": benchmark_answers_match(dataset_name, predicted_answer, answer),
                 "spec_tokens": len(generated_ids),
                 "spec_seconds": seconds,
                 "spec_tokens_per_second": len(generated_ids) / max(seconds, 1e-9),
@@ -785,14 +926,14 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
             "spec_acceptance_ratio:",
             spec_stats["acceptance_ratio"],
             "correct:",
-            answers_match(predicted_answer, answer),
+            benchmark_answers_match(dataset_name, predicted_answer, answer),
             "tokens/sec:",
             len(generated_ids) / max(seconds, 1e-9),
         )
 
     df = pd.DataFrame(results)
     csv_name = (
-        f"spec_power_{config.draft_model_key}_to_{config.target_model_key}_"
+        f"spec_power_{dataset_name}_{config.draft_model_key}_to_{config.target_model_key}_"
         f"alpha{config.alpha}_block{config.block_size}_steps{config.mcmc_steps_per_block}_"
         f"batch{config.batch_idx}_seed{config.seed}.csv"
     )

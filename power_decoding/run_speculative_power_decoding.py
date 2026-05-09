@@ -4,7 +4,8 @@ from power_sampling_common import SpeculativeExperimentConfig, run_speculative_e
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Speculative power decoding on MATH500.")
+    parser = argparse.ArgumentParser(description="Speculative power decoding on MATH500 or GPQA.")
+    parser.add_argument("--dataset", choices=("math", "gpqa"), default="math")
     parser.add_argument("--target-model-key", default="qwen3_8b")
     parser.add_argument("--draft-model-key", default="qwen3_small")
     parser.add_argument("--batch-idx", type=int, default=0)
@@ -16,7 +17,11 @@ def parse_args():
     parser.add_argument("--draft-temperature", type=float, default=1.0)
     parser.add_argument("--max-problems", type=int, default=10)
     parser.add_argument("--save-dir", default="results")
-    parser.add_argument("--data-path", default="MATH500.json")
+    parser.add_argument(
+        "--data-path",
+        default=None,
+        help="Benchmark data path. Defaults to MATH500.json for math and GPQA.jsonl for gpqa.",
+    )
     parser.add_argument("--no-cot", action="store_true")
     return parser.parse_args()
 
@@ -26,6 +31,7 @@ def main():
     config = SpeculativeExperimentConfig(
         target_model_key=args.target_model_key,
         draft_model_key=args.draft_model_key,
+        dataset=args.dataset,
         batch_idx=args.batch_idx,
         seed=args.seed,
         alpha=args.alpha,
