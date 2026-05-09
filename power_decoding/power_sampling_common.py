@@ -189,12 +189,9 @@ def load_gpqa(path):
     raise ValueError(f"Unsupported GPQA data file extension: {path.suffix}")
 
 
-def select_shard(dataset, batch_idx, max_problems, shard_size=100):
-    start = shard_size * batch_idx
-    end = shard_size * (batch_idx + 1)
-    if max_problems is not None:
-        end = min(start + int(max_problems), end)
-    return start, end, dataset[start:end]
+def select_examples(dataset, max_problems):
+    end = len(dataset) if max_problems is None else min(int(max_problems), len(dataset))
+    return 0, end, dataset[:end]
 
 
 def default_data_path(dataset_name):
@@ -209,9 +206,9 @@ def load_benchmark_dataset(dataset_name, data_path):
     data_path = data_path or default_data_path(dataset_name)
     if dataset_name == "math":
         data_path = ensure_math500(data_path)
-        return data_path, load_math500(data_path), 100
+        return data_path, load_math500(data_path)
     if dataset_name == "gpqa":
-        return Path(data_path), load_gpqa(data_path), 33
+        return Path(data_path), load_gpqa(data_path)
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -447,7 +444,6 @@ def sync_cuda(device):
 class PowerExperimentConfig:
     model_key: str = "qwen3_8b"
     dataset: str = "math"
-    batch_idx: int = 0
     seed: int = 0
     mcmc_steps: int = 4
     temperature: float = 0.25
@@ -476,12 +472,12 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     jump_size = config.max_new_tokens // config.block_num
     effective_window_blocks = config.local_window_blocks if config.local_moves else config.block_num
     recent_window_tokens = effective_window_blocks * jump_size
-    data_path, dataset, shard_size = load_benchmark_dataset(dataset_name, config.data_path)
-    start, end, shard = select_shard(dataset, config.batch_idx, config.max_problems, shard_size=shard_size)
+    data_path, dataset = load_benchmark_dataset(dataset_name, config.data_path)
+    start, end, shard = select_examples(dataset, config.max_problems)
 
     model_str = MODEL_REPOS[config.model_key]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"shard [{start}, {end}) of {dataset_name.upper()}, model={model_str} device={device} data={data_path}")
+    print(f"examples [{start}, {end}) of {dataset_name.upper()}, model={model_str} device={device} data={data_path}")
 
     out_dir = Path(config.save_dir) / config.model_key
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -635,7 +631,7 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     csv_name = (
         f"{config.model_key}_{dataset_name}_power_{experiment_name}_"
         f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
-        f"batch{config.batch_idx}_seed{config.seed}.csv"
+        f"n{len(shard)}_seed{config.seed}.csv"
     )
     out_path = out_dir / csv_name
     df.to_csv(out_path, index=False)
@@ -814,7 +810,6 @@ class SpeculativeExperimentConfig:
     target_model_key: str = "qwen3_8b"
     draft_model_key: str = "qwen3_small"
     dataset: str = "math"
-    batch_idx: int = 0
     seed: int = 0
     alpha: float = 4.0
     block_size: int = 64
@@ -832,14 +827,14 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
     dataset_name = config.dataset.lower()
     if dataset_name not in ("math", "gpqa"):
         raise ValueError(f"Unsupported dataset: {config.dataset}")
-    data_path, dataset, shard_size = load_benchmark_dataset(dataset_name, config.data_path)
-    start, end, shard = select_shard(dataset, config.batch_idx, config.max_problems, shard_size=shard_size)
+    data_path, dataset = load_benchmark_dataset(dataset_name, config.data_path)
+    start, end, shard = select_examples(dataset, config.max_problems)
 
     target_model_str = MODEL_REPOS[config.target_model_key]
     draft_model_str = MODEL_REPOS[config.draft_model_key]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(
-        f"spec shard [{start}, {end}) of {dataset_name.upper()} "
+        f"spec examples [{start}, {end}) of {dataset_name.upper()} "
         f"target={target_model_str} draft={draft_model_str} device={device} data={data_path}"
     )
 
@@ -935,7 +930,7 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
     csv_name = (
         f"spec_power_{dataset_name}_{config.draft_model_key}_to_{config.target_model_key}_"
         f"alpha{config.alpha}_block{config.block_size}_steps{config.mcmc_steps_per_block}_"
-        f"batch{config.batch_idx}_seed{config.seed}.csv"
+        f"n{len(shard)}_seed{config.seed}.csv"
     )
     out_path = out_dir / csv_name
     df.to_csv(out_path, index=False)

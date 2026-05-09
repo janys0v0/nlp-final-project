@@ -8,7 +8,6 @@ def parse_args():
     parser.add_argument("--dataset", choices=("math", "gpqa"), default="math")
     parser.add_argument("--target-model-key", default="qwen3_8b")
     parser.add_argument("--draft-model-key", default="qwen3_small")
-    parser.add_argument("--batch-idx", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=4.0)
     parser.add_argument("--block-size", type=int, default=64)
@@ -32,7 +31,6 @@ def main():
         target_model_key=args.target_model_key,
         draft_model_key=args.draft_model_key,
         dataset=args.dataset,
-        batch_idx=args.batch_idx,
         seed=args.seed,
         alpha=args.alpha,
         block_size=args.block_size,
