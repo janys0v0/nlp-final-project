@@ -271,6 +271,7 @@ def format_prompt(question, model_key, tokenizer, cot=True):
         "qwen_instruct_small",
         "qwen3_small",
         "qwen3_8b",
+        "qwen_math_instruct",
         "qwen_math_grpo",
         "phi_grpo",
         "phi",
