@@ -31,6 +31,7 @@ MODEL_REPOS = {
     "qwen_small": "Qwen/Qwen2.5-0.5B",
     "qwen_instruct_small": "Qwen/Qwen2.5-0.5B-Instruct",
     "qwen_math": "Qwen/Qwen2.5-Math-7B",
+    "qwen_math_instruct": "Qwen/Qwen2.5-Math-7B-Instruct",
     "qwen_math_small": "Qwen/Qwen2.5-Math-1.5B",
     "qwen3_small": "Qwen/Qwen3-0.6B",
     "qwen3_8b": "Qwen/Qwen3-8B",
