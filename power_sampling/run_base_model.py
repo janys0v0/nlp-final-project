@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument("--model-key", default="qwen3_8b")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.25)
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--max-new-tokens", type=int, default=3072)
     parser.add_argument("--max-problems", type=int, default=10)
     parser.add_argument("--save-dir", default="results")
     parser.add_argument(
