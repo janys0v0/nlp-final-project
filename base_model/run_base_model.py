@@ -124,7 +124,7 @@ def main():
             "naive_tokens_per_second": len(output_ids) / max(seconds, 1e-9),
         }
         results.append(row)
-        if len(results) % 5 == 0:
+        if len(results) % 1 == 0:
             pd.DataFrame(results).to_csv(out_path, index=False)
             print(f"checkpoint -> {out_path} ({len(results)}/{len(shard)})")
 
