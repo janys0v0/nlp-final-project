@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
-from power_sampling_common import (
+from normal_sampling_common import (
     MODEL_REPOS,
     answers_match,
     encode_text_prompt,
@@ -61,6 +61,13 @@ def main():
         print(f"[diag] gpu={torch.cuda.get_device_name(0)} cuda={torch.version.cuda}")
 
     do_sample = args.temperature > 0
+    out_dir = Path(args.save_dir) / "normal_sampling"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = (
+        out_dir
+        / f"{args.model_key}_math_base_temp{args.temperature}_batch{args.batch_idx}_seed{args.seed}.csv"
+    )
+
     results = []
     for data in tqdm(shard, desc="MATH base model"):
         question = data["prompt"]
@@ -108,7 +115,6 @@ def main():
             "base_do_sample": do_sample,
             "base_hit_eos": hit_eos,
             "base_truncated": not hit_eos,
-            # Compatibility with the notebook baseline block.
             "naive_completion": completion,
             "naive_answer": parsed_answer,
             "naive_answer_normalized": normalized_answer,
@@ -118,13 +124,10 @@ def main():
             "naive_tokens_per_second": len(output_ids) / max(seconds, 1e-9),
         }
         results.append(row)
+        if len(results) % 5 == 0:
+            pd.DataFrame(results).to_csv(out_path, index=False)
+            print(f"checkpoint -> {out_path} ({len(results)}/{len(shard)})")
 
-    out_dir = Path(args.save_dir) / args.model_key
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = (
-        out_dir
-        / f"{args.model_key}_math_base_temp{args.temperature}_batch{args.batch_idx}_seed{args.seed}.csv"
-    )
     pd.DataFrame(results).to_csv(out_path, index=False)
     print("Saved:", out_path)
 
