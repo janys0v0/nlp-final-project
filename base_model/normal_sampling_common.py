@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -17,6 +18,12 @@ from tqdm.auto import tqdm
 PROMPT = "Can you solve the following math problem? "
 BASE = " Put your final answer within \\boxed{{}}."
 COT = " Please reason step by step, and put your final answer within \\boxed{{}}."
+GPQA_QUERY_TEMPLATE = (
+    "Answer the following multiple choice question. The last line of your response "
+    "should be of the following format: '\\boxed{{$LETTER}}' (without quotes) "
+    "where LETTER is one of ABCD (ex. '\\boxed{{A}}'). Think step by step before answering.\n\n"
+    "{Question}\n\nA) {A}\nB) {B}\nC) {C}\nD) {D}"
+)
 
 # Kept in sync with other sampling modules.
 MODEL_REPOS = {
@@ -99,6 +106,29 @@ def answers_match(prediction, target):
     return pred_norm is not None and target_norm is not None and pred_norm == target_norm
 
 
+def normalize_choice_answer(answer):
+    if answer is None:
+        return None
+    s = str(answer).strip().upper()
+    boxed = last_boxed_only_string(s)
+    if boxed is not None:
+        s = remove_boxed(boxed) or s
+        s = s.strip().upper()
+    stripped = s.strip()
+    if stripped in {"A", "B", "C", "D"}:
+        return stripped
+    matches = re.findall(r"\b([ABCD])\b", s)
+    if matches:
+        return matches[-1]
+    return None
+
+
+def choice_answers_match(prediction, target):
+    pred_norm = normalize_choice_answer(prediction)
+    target_norm = normalize_choice_answer(target)
+    return pred_norm is not None and target_norm is not None and pred_norm == target_norm
+
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -118,6 +148,11 @@ def ensure_math500(path, repo="aakaran/reasoning-with-sampling", ref="main"):
 
 
 def load_math500(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def load_json_dataset(path):
     with open(path, "r") as f:
         return json.load(f)
 
@@ -173,6 +208,60 @@ def format_prompt(question, model_key, tokenizer, cot=True):
             enable_thinking=False,
         )
     return format_str
+
+
+def format_gpqa_prompt(example, model_key, tokenizer):
+    prompt = GPQA_QUERY_TEMPLATE.format(
+        Question=example["Question"],
+        A=example["A"],
+        B=example["B"],
+        C=example["C"],
+        D=example["D"],
+    )
+    if model_key in ("qwen", "qwen_small", "qwen_math", "qwen_math_small"):
+        return prompt
+    answer_context = [{"role": "user", "content": prompt}]
+    return tokenizer.apply_chat_template(
+        answer_context,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+
+
+def benchmark_question(example, benchmark):
+    if benchmark == "math500":
+        return example["prompt"]
+    if benchmark == "gpqa":
+        return example["Question"]
+    raise ValueError(f"Unsupported benchmark: {benchmark}")
+
+
+def benchmark_answer(example, benchmark):
+    if benchmark == "math500":
+        return example["answer"]
+    if benchmark == "gpqa":
+        for key in ("Answer", "answer", "correct_answer"):
+            if key in example:
+                return example[key]
+        raise KeyError("GPQA example is missing one of: Answer, answer, correct_answer")
+    raise ValueError(f"Unsupported benchmark: {benchmark}")
+
+
+def normalize_benchmark_answer(answer, benchmark):
+    if benchmark == "math500":
+        return normalize_math_answer(answer)
+    if benchmark == "gpqa":
+        return normalize_choice_answer(answer)
+    raise ValueError(f"Unsupported benchmark: {benchmark}")
+
+
+def benchmark_answers_match(prediction, target, benchmark):
+    if benchmark == "math500":
+        return answers_match(prediction, target)
+    if benchmark == "gpqa":
+        return choice_answers_match(prediction, target)
+    raise ValueError(f"Unsupported benchmark: {benchmark}")
 
 
 @dataclass
