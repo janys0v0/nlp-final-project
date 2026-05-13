@@ -5,3 +5,6 @@
 # Edit and use:  POD=root@1.2.3.4 bin/sync/backup_loop.sh    (replace with your username&IP)
 
 results/
+power_sampling/results/
+power_decoding/results/
+base_model/results/
