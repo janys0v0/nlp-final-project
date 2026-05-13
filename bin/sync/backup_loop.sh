@@ -22,7 +22,7 @@ set -euo pipefail
 
 : "${POD:?set POD=user@host}"
 
-INTERVAL="${INTERVAL:-3}"
+INTERVAL="${INTERVAL:-30}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOCAL_REPO="${LOCAL_REPO:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 REMOTE_REPO="${REMOTE_REPO:-nlp-final-project/}"
@@ -71,6 +71,8 @@ while true; do
     # -i (itemize) emits one line per change like ">f+++++++++ path/file"; we
     # count those instead of parsing --stats labels (which vary across rsync
     # versions / openrsync on macOS).
+
+    out=""
     if out=$(rsync -ai --partial --exclude='*.tmp' "$src" "$dst" 2>&1); then
       n=$(printf '%s\n' "$out" | awk '/^>f/ {n++} END {print n+0}')
       pulled_total=$((pulled_total + n))
@@ -79,18 +81,22 @@ while true; do
         printf '%s\n' "$out" | awk '/^>f/ {sub(/^[^ ]+[ ]+/, ""); print "        " $0}'
       fi
     else
-      printf '[%s]   %-24s  FAILED\n' "$(date +%T)" "$p"
-      printf '%s\n' "$out" | sed 's/^/      /'
-      failures=$((failures + 1))
+      # If directory or file is missing, do not show *any* message; only surface info when something is found.
+      if echo "$out" | grep -q "No such file or directory"; then
+        # Silently skip missing path without any message to match requested behavior
+        continue
+      else
+        printf '[%s]   %-24s  FAILED\n' "$(date +%T)" "$p"
+        printf '%s\n' "$out" | sed 's/^/      /'
+        failures=$((failures + 1))
+      fi
     fi
   done
   if (( failures == 0 )); then
     if (( pulled_total > 0 )); then
       printf '[%s] iter %d: pulled %d new file(s) across %d path(s); next pull in %ss\n' \
              "$(date +%T)" "$iter" "$pulled_total" "${#PATHS[@]}" "$INTERVAL"
-    else
-      printf '[%s] iter %d: no changes; next pull in %ss\n' \
-             "$(date +%T)" "$iter" "$INTERVAL"
+    # Do NOT print anything if there are no changes and also no pulled files.
     fi
   else
     printf '[%s] iter %d: %d/%d path(s) failed; retry in %ss\n' \

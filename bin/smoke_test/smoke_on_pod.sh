@@ -3,12 +3,12 @@
 # to ./outputs/smoke/ on the local machine.
 #
 # Usage:
-#   scripts/smoke_on_pod.sh <ssh-dest> [-- <smoke_generate.py args...>]
+#   bin/smoke_test/smoke_on_pod.sh <ssh-dest> [-- <smoke_generate.py args...>]
 #
 # Examples:
-#   scripts/smoke_on_pod.sh root@193.7.0.42
-#   scripts/smoke_on_pod.sh root@193.7.0.42 -- --model Qwen/Qwen2.5-0.5B
-#   scripts/smoke_on_pod.sh root@193.7.0.42 -- --max-new-tokens 128 --temperature 0.0
+#   bin/smoke_test/smoke_on_pod.sh root@193.7.0.42
+#   bin/smoke_test/smoke_on_pod.sh root@193.7.0.42 -- --model Qwen/Qwen2.5-0.5B
+#   bin/smoke_test/smoke_on_pod.sh root@193.7.0.42 -- --max-new-tokens 128 --temperature 0.0
 #
 # Get the SSH destination from `prime pods status <pod-id>` or `prime pods ssh <pod-id>`.
 #
