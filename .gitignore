@@ -34,3 +34,5 @@ hf_cache/
 # Secrets
 .env
 *.log
+
+NLP_project_report.pdf

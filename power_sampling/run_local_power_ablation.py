@@ -7,9 +7,16 @@ MCMC_LOCAL_MOVES = True
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Local/windowed power-sampling ablation on MATH500.")
+    parser = argparse.ArgumentParser(description="Local/windowed power-sampling ablation on MATH500 or GPQA.")
+    parser.add_argument("--dataset", choices=("math", "gpqa"), default="math")
     parser.add_argument("--model-key", default="qwen3_8b")
-    parser.add_argument("--batch-idx", type=int, default=0)
+    parser.add_argument("--start-idx", type=int, default=0, help="Inclusive start index into the dataset.")
+    parser.add_argument(
+        "--end-idx",
+        type=int,
+        default=None,
+        help="Exclusive end index. Default: process to the end of the dataset.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mcmc-steps", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.25)
@@ -21,9 +28,18 @@ def parse_args():
         default=1,
         help="MCMC proposals resample within the most recent N blocks (N * jump_size tokens). Default 1.",
     )
-    parser.add_argument("--max-problems", type=int, default=10)
+    parser.add_argument(
+        "--max-problems",
+        type=int,
+        default=None,
+        help="Optional cap on number of problems within the range; default: full range.",
+    )
     parser.add_argument("--save-dir", default="results")
-    parser.add_argument("--data-path", default="MATH500.json")
+    parser.add_argument(
+        "--data-path",
+        default=None,
+        help="Benchmark data path. Defaults to MATH500.json for math and GPQA.jsonl for gpqa.",
+    )
     parser.add_argument("--no-cot", action="store_true")
     parser.add_argument("--skip-naive-std", action="store_true")
     return parser.parse_args()
@@ -33,7 +49,9 @@ def main():
     args = parse_args()
     config = PowerExperimentConfig(
         model_key=args.model_key,
-        batch_idx=args.batch_idx,
+        dataset=args.dataset,
+        start_idx=args.start_idx,
+        end_idx=args.end_idx,
         seed=args.seed,
         mcmc_steps=args.mcmc_steps,
         temperature=args.temperature,

@@ -9,15 +9,18 @@ from tqdm.auto import tqdm
 from power_sampling_common import (
     MODEL_REPOS,
     benchmark_answers_match,
+    config_signature,
     encode_text_prompt,
     infer_model_device,
     load_benchmark_dataset,
+    load_existing_progress,
     load_generation_model,
     load_text_processor,
     normalize_benchmark_answer,
     parse_benchmark_answer,
     prepare_benchmark_example,
-    select_examples,
+    range_slug,
+    select_range,
     set_seed,
     sync_cuda,
 )
@@ -27,10 +30,22 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Base-model-only generation on MATH500 or GPQA.")
     parser.add_argument("--dataset", choices=("math", "gpqa"), default="math")
     parser.add_argument("--model-key", default="qwen3_8b")
+    parser.add_argument("--start-idx", type=int, default=0, help="Inclusive start index into the dataset.")
+    parser.add_argument(
+        "--end-idx",
+        type=int,
+        default=None,
+        help="Exclusive end index. Default: process to the end of the dataset.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.25)
     parser.add_argument("--max-new-tokens", type=int, default=3072)
-    parser.add_argument("--max-problems", type=int, default=10)
+    parser.add_argument(
+        "--max-problems",
+        type=int,
+        default=None,
+        help="Optional cap on number of problems within the range; default: full range.",
+    )
     parser.add_argument("--save-dir", default="results")
     parser.add_argument(
         "--data-path",
@@ -45,13 +60,33 @@ def main():
     args = parse_args()
     set_seed(args.seed)
     dataset_name = args.dataset.lower()
+    if args.model_key not in MODEL_REPOS:
+        raise SystemExit(f"Unknown --model-key {args.model_key!r}; choose from {sorted(MODEL_REPOS)}")
 
     data_path, dataset = load_benchmark_dataset(dataset_name, args.data_path)
-    start, end, shard = select_examples(dataset, args.max_problems)
+    start, end, shard = select_range(dataset, args.start_idx, args.end_idx, args.max_problems)
 
     model_str = MODEL_REPOS[args.model_key]
     device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"examples [{start}, {end}) of {dataset_name.upper()}, model={model_str} device={device_name} data={data_path}")
+    print(f"range [{start}, {end}) of {dataset_name.upper()}, model={model_str} device={device_name} data={data_path}")
+
+    out_dir = Path(args.save_dir) / args.model_key
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg_sig = config_signature(
+        args.max_new_tokens,
+        int(not args.no_cot),
+        args.data_path,
+    )
+    out_path = (
+        out_dir
+        / f"{args.model_key}_{dataset_name}_base_temp{args.temperature}_{range_slug(args.start_idx, args.end_idx)}_seed{args.seed}_cfg{cfg_sig}.csv"
+    )
+
+    results = load_existing_progress(out_path)
+    pickup = min(len(results), len(shard))
+    if pickup > 0:
+        print(f"[resume] {out_path} has {pickup} completed rows; continuing from index {start + pickup}")
+
     print("Loading tokenizer and model...")
     processor, tokenizer = load_text_processor(model_str)
     hf_model = load_generation_model(model_str)
@@ -64,10 +99,9 @@ def main():
         print(f"[diag] gpu={torch.cuda.get_device_name(0)} cuda={torch.version.cuda}")
 
     do_sample = args.temperature > 0
-    results = []
     for problem_idx, data in tqdm(
-        enumerate(shard, start=start),
-        total=len(shard),
+        enumerate(shard[pickup:], start=start + pickup),
+        total=len(shard) - pickup,
         desc=f"{dataset_name.upper()} base model",
     ):
         question, answer, input_text = prepare_benchmark_example(
@@ -131,13 +165,9 @@ def main():
             "naive_tokens_per_second": len(output_ids) / max(seconds, 1e-9),
         }
         results.append(row)
+        pd.DataFrame(results).to_csv(out_path, index=False)
+        print(f"checkpoint -> {out_path} ({len(results)}/{len(shard)})")
 
-    out_dir = Path(args.save_dir) / args.model_key
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = (
-        out_dir
-        / f"{args.model_key}_{dataset_name}_base_temp{args.temperature}_n{len(shard)}_seed{args.seed}.csv"
-    )
     pd.DataFrame(results).to_csv(out_path, index=False)
     print("Saved:", out_path)
 

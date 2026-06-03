@@ -8,13 +8,25 @@ def parse_args():
     parser.add_argument("--dataset", choices=("math", "gpqa"), default="math")
     parser.add_argument("--target-model-key", default="qwen3_8b")
     parser.add_argument("--draft-model-key", default="qwen3_small")
+    parser.add_argument("--start-idx", type=int, default=0, help="Inclusive start index into the dataset.")
+    parser.add_argument(
+        "--end-idx",
+        type=int,
+        default=None,
+        help="Exclusive end index. Default: process to the end of the dataset.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--alpha", type=float, default=4.0)
     parser.add_argument("--block-size", type=int, default=192)
     parser.add_argument("--mcmc-steps-per-block", type=int, default=10)
     parser.add_argument("--max-new-tokens", type=int, default=3072)
     parser.add_argument("--draft-temperature", type=float, default=1.0)
-    parser.add_argument("--max-problems", type=int, default=10)
+    parser.add_argument(
+        "--max-problems",
+        type=int,
+        default=None,
+        help="Optional cap on number of problems within the range; default: full range.",
+    )
     parser.add_argument("--save-dir", default="results")
     parser.add_argument(
         "--data-path",
@@ -31,6 +43,8 @@ def main():
         target_model_key=args.target_model_key,
         draft_model_key=args.draft_model_key,
         dataset=args.dataset,
+        start_idx=args.start_idx,
+        end_idx=args.end_idx,
         seed=args.seed,
         alpha=args.alpha,
         block_size=args.block_size,

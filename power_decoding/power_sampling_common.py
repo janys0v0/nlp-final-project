@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -32,6 +33,7 @@ MODEL_REPOS = {
     "qwen_instruct_small": "Qwen/Qwen2.5-0.5B-Instruct",
     "qwen_math": "Qwen/Qwen2.5-Math-7B",
     "qwen_math_small": "Qwen/Qwen2.5-Math-1.5B",
+    "qwen_math_instruct": "Qwen/Qwen2.5-Math-7B-Instruct",
     "qwen3_small": "Qwen/Qwen3-0.6B",
     "qwen3_8b": "Qwen/Qwen3-8B",
     "qwen_math_grpo": "stellalisy/rethink_rlvr_reproduce-ground_truth-qwen2.5_math_7b-lr5e-7-kl0.00-step150",
@@ -194,6 +196,54 @@ def select_examples(dataset, max_problems):
     return 0, end, dataset[:end]
 
 
+def select_range(dataset, start_idx, end_idx, max_problems):
+    start = max(0, int(start_idx or 0))
+    end = len(dataset) if end_idx is None else min(int(end_idx), len(dataset))
+    if max_problems is not None:
+        end = min(start + int(max_problems), end)
+    if end < start:
+        end = start
+    return start, end, dataset[start:end]
+
+
+def range_slug(start_idx, end_idx):
+    end_str = "end" if end_idx is None else str(int(end_idx))
+    return f"range{int(start_idx or 0)}-{end_str}"
+
+
+def config_signature(*parts):
+    payload = "|".join("None" if p is None else str(p) for p in parts)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
+
+
+def ensure_compatible_tokenizers(target_tokenizer, draft_tokenizer, target_label="target", draft_label="draft"):
+    target_vocab = target_tokenizer.get_vocab()
+    draft_vocab = draft_tokenizer.get_vocab()
+    if target_vocab != draft_vocab:
+        raise ValueError(
+            "Speculative decoding requires identical tokenizers on the target and draft. "
+            f"Vocabularies differ between {target_label} and {draft_label}: "
+            f"target_size={len(target_vocab)}, draft_size={len(draft_vocab)}."
+        )
+    if target_tokenizer.eos_token_id != draft_tokenizer.eos_token_id:
+        raise ValueError(
+            f"Target and draft tokenizers disagree on eos_token_id: "
+            f"{target_tokenizer.eos_token_id} vs {draft_tokenizer.eos_token_id}."
+        )
+
+
+def load_existing_progress(out_path):
+    out_path = Path(out_path)
+    if not out_path.exists():
+        return []
+    try:
+        existing = pd.read_csv(out_path)
+    except Exception as exc:
+        print(f"[resume] could not read {out_path}: {exc}; starting fresh")
+        return []
+    return existing.to_dict("records")
+
+
 def default_data_path(dataset_name):
     if dataset_name == "math":
         return "MATH500.json"
@@ -262,6 +312,7 @@ def format_prompt(question, model_key, tokenizer, cot=True):
         "qwen_instruct_small",
         "qwen3_small",
         "qwen3_8b",
+        "qwen_math_instruct",
         "qwen_math_grpo",
         "phi_grpo",
         "phi",
@@ -442,14 +493,16 @@ def sync_cuda(device):
 
 @dataclass
 class PowerExperimentConfig:
-    model_key: str = "qwen3_8b"
+    model_key: str = "qwen_math"
     dataset: str = "math"
+    start_idx: int = 0
+    end_idx: int | None = None
     seed: int = 0
     mcmc_steps: int = 4
     temperature: float = 0.25
     max_new_tokens: int = 1024
     block_num: int = 16
-    max_problems: int | None = 10
+    max_problems: int | None = None
     save_dir: str = "results"
     data_path: str | None = None
     use_cot: bool = True
@@ -473,14 +526,33 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     effective_window_blocks = config.local_window_blocks if config.local_moves else config.block_num
     recent_window_tokens = effective_window_blocks * jump_size
     data_path, dataset = load_benchmark_dataset(dataset_name, config.data_path)
-    start, end, shard = select_examples(dataset, config.max_problems)
+    start, end, shard = select_range(dataset, config.start_idx, config.end_idx, config.max_problems)
 
     model_str = MODEL_REPOS[config.model_key]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"examples [{start}, {end}) of {dataset_name.upper()}, model={model_str} device={device} data={data_path}")
+    print(f"range [{start}, {end}) of {dataset_name.upper()}, model={model_str} device={device} data={data_path}")
 
     out_dir = Path(config.save_dir) / config.model_key
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg_sig = config_signature(
+        config.max_new_tokens,
+        int(bool(config.use_cot)),
+        config.local_moves,
+        config.data_path,
+        config.include_baselines,
+    )
+    csv_name = (
+        f"{config.model_key}_{dataset_name}_power_{experiment_name}_"
+        f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
+        f"{range_slug(config.start_idx, config.end_idx)}_seed{config.seed}_cfg{cfg_sig}.csv"
+    )
+    out_path = out_dir / csv_name
+
+    results = load_existing_progress(out_path)
+    pickup = min(len(results), len(shard))
+    if pickup > 0:
+        print(f"[resume] {out_path} has {pickup} completed rows; continuing from index {start + pickup}")
 
     print("Loading tokenizer and model...")
     processor, tokenizer = load_text_processor(model_str)
@@ -494,10 +566,9 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     if torch.cuda.is_available():
         print(f"[diag] gpu={torch.cuda.get_device_name(0)} cuda={torch.version.cuda}")
 
-    results = []
     for problem_idx, data in tqdm(
-        enumerate(shard, start=start),
-        total=len(shard),
+        enumerate(shard[pickup:], start=start + pickup),
+        total=len(shard) - pickup,
         desc=f"{dataset_name.upper()} {experiment_name} power sampling",
     ):
         question, answer, input_text = prepare_benchmark_example(
@@ -620,20 +691,16 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
             }
         )
         results.append(row)
+        pd.DataFrame(results).to_csv(out_path, index=False)
         print(
             "acceptance_ratio:",
             acceptance_ratio,
             "mcmc_correct:",
             benchmark_answers_match(dataset_name, mcmc_answer, answer),
+            f"checkpoint -> {out_path} ({len(results)}/{len(shard)})",
         )
 
     df = pd.DataFrame(results)
-    csv_name = (
-        f"{config.model_key}_{dataset_name}_power_{experiment_name}_"
-        f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
-        f"n{len(shard)}_seed{config.seed}.csv"
-    )
-    out_path = out_dir / csv_name
     df.to_csv(out_path, index=False)
     metric_cols = [
         "mcmc_correct",
@@ -807,16 +874,18 @@ def run_speculative_power_sampling(
 
 @dataclass
 class SpeculativeExperimentConfig:
-    target_model_key: str = "qwen3_8b"
-    draft_model_key: str = "qwen3_small"
+    target_model_key: str = "qwen_math"
+    draft_model_key: str | None = None
     dataset: str = "math"
+    start_idx: int = 0
+    end_idx: int | None = None
     seed: int = 0
     alpha: float = 4.0
     block_size: int = 64
     mcmc_steps_per_block: int = 4
     max_new_tokens: int = 1024
     draft_temperature: float = 1.0
-    max_problems: int | None = 10
+    max_problems: int | None = None
     save_dir: str = "results"
     data_path: str | None = None
     use_cot: bool = True
@@ -827,22 +896,56 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
     dataset_name = config.dataset.lower()
     if dataset_name not in ("math", "gpqa"):
         raise ValueError(f"Unsupported dataset: {config.dataset}")
+    if not config.target_model_key:
+        raise ValueError("SpeculativeExperimentConfig.target_model_key is required.")
+    if not config.draft_model_key:
+        raise ValueError("SpeculativeExperimentConfig.draft_model_key is required.")
+    if config.target_model_key not in MODEL_REPOS:
+        raise ValueError(f"Unknown target_model_key {config.target_model_key!r}; choose from {sorted(MODEL_REPOS)}")
+    if config.draft_model_key not in MODEL_REPOS:
+        raise ValueError(f"Unknown draft_model_key {config.draft_model_key!r}; choose from {sorted(MODEL_REPOS)}")
     data_path, dataset = load_benchmark_dataset(dataset_name, config.data_path)
-    start, end, shard = select_examples(dataset, config.max_problems)
+    start, end, shard = select_range(dataset, config.start_idx, config.end_idx, config.max_problems)
 
     target_model_str = MODEL_REPOS[config.target_model_key]
     draft_model_str = MODEL_REPOS[config.draft_model_key]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(
-        f"spec examples [{start}, {end}) of {dataset_name.upper()} "
+        f"spec range [{start}, {end}) of {dataset_name.upper()} "
         f"target={target_model_str} draft={draft_model_str} device={device} data={data_path}"
     )
 
     out_dir = Path(config.save_dir) / "speculative_power"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Loading shared tokenizer...")
+    cfg_sig = config_signature(
+        config.max_new_tokens,
+        config.draft_temperature,
+        int(bool(config.use_cot)),
+        config.data_path,
+    )
+    csv_name = (
+        f"spec_power_{dataset_name}_{config.draft_model_key}_to_{config.target_model_key}_"
+        f"alpha{config.alpha}_block{config.block_size}_steps{config.mcmc_steps_per_block}_"
+        f"{range_slug(config.start_idx, config.end_idx)}_seed{config.seed}_cfg{cfg_sig}.csv"
+    )
+    out_path = out_dir / csv_name
+
+    results = load_existing_progress(out_path)
+    pickup = min(len(results), len(shard))
+    if pickup > 0:
+        print(f"[resume] {out_path} has {pickup} completed rows; continuing from index {start + pickup}")
+
+    print("Loading target tokenizer...")
     processor, tokenizer = load_text_processor(target_model_str)
+    print("Loading draft tokenizer and verifying compatibility...")
+    _, draft_tokenizer = load_text_processor(draft_model_str)
+    ensure_compatible_tokenizers(
+        tokenizer,
+        draft_tokenizer,
+        target_label=config.target_model_key,
+        draft_label=config.draft_model_key,
+    )
 
     print("Loading target model...")
     target_model = load_generation_model(target_model_str)
@@ -864,10 +967,9 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
         )
     print("Models loaded.")
 
-    results = []
     for problem_idx, data in tqdm(
-        enumerate(shard, start=start),
-        total=len(shard),
+        enumerate(shard[pickup:], start=start + pickup),
+        total=len(shard) - pickup,
         desc=f"{dataset_name.upper()} speculative power",
     ):
         question, answer, input_text = prepare_benchmark_example(
@@ -917,6 +1019,7 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
                 "spec_acceptances": spec_stats["acceptances"],
             }
         )
+        pd.DataFrame(results).to_csv(out_path, index=False)
         print(
             "spec_acceptance_ratio:",
             spec_stats["acceptance_ratio"],
@@ -924,15 +1027,10 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
             benchmark_answers_match(dataset_name, predicted_answer, answer),
             "tokens/sec:",
             len(generated_ids) / max(seconds, 1e-9),
+            f"checkpoint -> {out_path} ({len(results)}/{len(shard)})",
         )
 
     df = pd.DataFrame(results)
-    csv_name = (
-        f"spec_power_{dataset_name}_{config.draft_model_key}_to_{config.target_model_key}_"
-        f"alpha{config.alpha}_block{config.block_size}_steps{config.mcmc_steps_per_block}_"
-        f"n{len(shard)}_seed{config.seed}.csv"
-    )
-    out_path = out_dir / csv_name
     df.to_csv(out_path, index=False)
     metric_cols = [
         "spec_correct",

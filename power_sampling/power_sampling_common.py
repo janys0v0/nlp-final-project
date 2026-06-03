@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -201,6 +202,54 @@ def select_shard(dataset, batch_idx, max_problems, shard_size=100):
 def select_examples(dataset, max_problems):
     end = len(dataset) if max_problems is None else min(int(max_problems), len(dataset))
     return 0, end, dataset[:end]
+
+
+def select_range(dataset, start_idx, end_idx, max_problems):
+    start = max(0, int(start_idx or 0))
+    end = len(dataset) if end_idx is None else min(int(end_idx), len(dataset))
+    if max_problems is not None:
+        end = min(start + int(max_problems), end)
+    if end < start:
+        end = start
+    return start, end, dataset[start:end]
+
+
+def range_slug(start_idx, end_idx):
+    end_str = "end" if end_idx is None else str(int(end_idx))
+    return f"range{int(start_idx or 0)}-{end_str}"
+
+
+def config_signature(*parts):
+    payload = "|".join("None" if p is None else str(p) for p in parts)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:8]
+
+
+def ensure_compatible_tokenizers(target_tokenizer, draft_tokenizer, target_label="target", draft_label="draft"):
+    target_vocab = target_tokenizer.get_vocab()
+    draft_vocab = draft_tokenizer.get_vocab()
+    if target_vocab != draft_vocab:
+        raise ValueError(
+            "Speculative decoding requires identical tokenizers on the target and draft. "
+            f"Vocabularies differ between {target_label} and {draft_label}: "
+            f"target_size={len(target_vocab)}, draft_size={len(draft_vocab)}."
+        )
+    if target_tokenizer.eos_token_id != draft_tokenizer.eos_token_id:
+        raise ValueError(
+            f"Target and draft tokenizers disagree on eos_token_id: "
+            f"{target_tokenizer.eos_token_id} vs {draft_tokenizer.eos_token_id}."
+        )
+
+
+def load_existing_progress(out_path):
+    out_path = Path(out_path)
+    if not out_path.exists():
+        return []
+    try:
+        existing = pd.read_csv(out_path)
+    except Exception as exc:
+        print(f"[resume] could not read {out_path}: {exc}; starting fresh")
+        return []
+    return existing.to_dict("records")
 
 
 def default_data_path(dataset_name):
@@ -452,16 +501,18 @@ def sync_cuda(device):
 
 @dataclass
 class PowerExperimentConfig:
-    model_key: str = "qwen3_8b"
-    batch_idx: int = 0
+    model_key: str = "qwen"
+    dataset: str = "math"
+    start_idx: int = 0
+    end_idx: int | None = None
     seed: int = 0
     mcmc_steps: int = 4
     temperature: float = 0.25
     max_new_tokens: int = 1024
     block_num: int = 16
-    max_problems: int | None = 10
+    max_problems: int | None = None
     save_dir: str = "results"
-    data_path: str = "MATH500.json"
+    data_path: str | None = None
     use_cot: bool = True
     local_moves: bool = True
     local_window_blocks: int = 1
@@ -470,6 +521,9 @@ class PowerExperimentConfig:
 
 def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     set_seed(config.seed)
+    dataset_name = config.dataset.lower()
+    if dataset_name not in ("math", "gpqa"):
+        raise ValueError(f"Unsupported dataset: {config.dataset}")
     if config.max_new_tokens % config.block_num != 0:
         raise ValueError(f"max_new_tokens must be divisible by block_num: {config.max_new_tokens} % {config.block_num}")
     if config.local_window_blocks < 1:
@@ -479,16 +533,34 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     jump_size = config.max_new_tokens // config.block_num
     effective_window_blocks = config.local_window_blocks if config.local_moves else config.block_num
     recent_window_tokens = effective_window_blocks * jump_size
-    data_path = ensure_math500(config.data_path)
-    dataset = load_math500(data_path)
-    start, end, shard = select_shard(dataset, config.batch_idx, config.max_problems)
+    data_path, dataset = load_benchmark_dataset(dataset_name, config.data_path)
+    start, end, shard = select_range(dataset, config.start_idx, config.end_idx, config.max_problems)
 
     model_str = MODEL_REPOS[config.model_key]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"shard [{start}, {end}) of MATH500, model={model_str} device={device}")
+    print(f"range [{start}, {end}) of {dataset_name.upper()}, model={model_str} device={device} data={data_path}")
 
     out_dir = Path(config.save_dir) / config.model_key
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg_sig = config_signature(
+        config.max_new_tokens,
+        int(bool(config.use_cot)),
+        config.local_moves,
+        config.data_path,
+        config.include_baselines,
+    )
+    csv_name = (
+        f"{config.model_key}_{dataset_name}_power_{experiment_name}_"
+        f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
+        f"{range_slug(config.start_idx, config.end_idx)}_seed{config.seed}_cfg{cfg_sig}.csv"
+    )
+    out_path = out_dir / csv_name
+
+    results = load_existing_progress(out_path)
+    pickup = min(len(results), len(shard))
+    if pickup > 0:
+        print(f"[resume] {out_path} has {pickup} completed rows; continuing from index {start + pickup}")
 
     print("Loading tokenizer and model...")
     processor, tokenizer = load_text_processor(model_str)
@@ -502,27 +574,29 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
     if torch.cuda.is_available():
         print(f"[diag] gpu={torch.cuda.get_device_name(0)} cuda={torch.version.cuda}")
 
-    csv_name = (
-        f"{config.model_key}_math_power_{experiment_name}_"
-        f"steps{config.mcmc_steps}_blocks{config.block_num}_window{effective_window_blocks}_temp{config.temperature}_"
-        f"batch{config.batch_idx}_seed{config.seed}.csv"
-    )
-    out_path = out_dir / csv_name
-
-    results = []
-    for data in tqdm(shard, desc=f"MATH {experiment_name} power sampling"):
-        question = data["prompt"]
-        answer = data["answer"]
-        input_text = format_prompt(question, config.model_key, tokenizer, config.use_cot)
+    for problem_idx, data in tqdm(
+        enumerate(shard[pickup:], start=start + pickup),
+        total=len(shard) - pickup,
+        desc=f"{dataset_name.upper()} {experiment_name} power sampling",
+    ):
+        question, answer, input_text = prepare_benchmark_example(
+            dataset_name,
+            data,
+            config.model_key,
+            tokenizer,
+            config.use_cot,
+            example_seed=config.seed + problem_idx,
+        )
         model_inputs = encode_text_prompt(processor, tokenizer, input_text, device)
         input_ids = model_inputs["input_ids"]
         prompt_len = input_ids.shape[1]
         prefix = [idx.item() for idx in input_ids[0]]
 
         row = {
+            "dataset": dataset_name,
             "question": question,
             "correct_answer": answer,
-            "correct_answer_normalized": normalize_math_answer(answer),
+            "correct_answer_normalized": normalize_benchmark_answer(dataset_name, answer),
         }
 
         if config.include_baselines:
@@ -559,22 +633,22 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
             std_ids = std_output.sequences[0, prompt_len:].to("cpu")
             naive_completion = tokenizer.decode(naive_ids, skip_special_tokens=True)
             std_completion = tokenizer.decode(std_ids, skip_special_tokens=True)
-            naive_answer = parse_answer(naive_completion)
-            std_answer = parse_answer(std_completion)
+            naive_answer = parse_benchmark_answer(dataset_name, naive_completion)
+            std_answer = parse_benchmark_answer(dataset_name, std_completion)
 
             row.update(
                 {
                     "naive_completion": naive_completion,
                     "naive_answer": naive_answer,
-                    "naive_answer_normalized": normalize_math_answer(naive_answer),
-                    "naive_correct": answers_match(naive_answer, answer),
+                    "naive_answer_normalized": normalize_benchmark_answer(dataset_name, naive_answer),
+                    "naive_correct": benchmark_answers_match(dataset_name, naive_answer, answer),
                     "naive_tokens": len(naive_ids),
                     "naive_seconds": naive_seconds,
                     "naive_tokens_per_second": len(naive_ids) / max(naive_seconds, 1e-9),
                     "std_completion": std_completion,
                     "std_answer": std_answer,
-                    "std_answer_normalized": normalize_math_answer(std_answer),
-                    "std_correct": answers_match(std_answer, answer),
+                    "std_answer_normalized": normalize_benchmark_answer(dataset_name, std_answer),
+                    "std_correct": benchmark_answers_match(dataset_name, std_answer, answer),
                     "std_tokens": len(std_ids),
                     "std_seconds": std_seconds,
                     "std_tokens_per_second": len(std_ids) / max(std_seconds, 1e-9),
@@ -598,14 +672,14 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
 
         mcmc_ids = mcmc_output[prompt_len:]
         mcmc_completion = tokenizer.decode(mcmc_ids, skip_special_tokens=True)
-        mcmc_answer = parse_answer(mcmc_completion)
+        mcmc_answer = parse_benchmark_answer(dataset_name, mcmc_completion)
         mcmc_hit_eos = tokenizer.eos_token_id in mcmc_ids
         row.update(
             {
                 "mcmc_completion": mcmc_completion,
                 "mcmc_answer": mcmc_answer,
-                "mcmc_answer_normalized": normalize_math_answer(mcmc_answer),
-                "mcmc_correct": answers_match(mcmc_answer, answer),
+                "mcmc_answer_normalized": normalize_benchmark_answer(dataset_name, mcmc_answer),
+                "mcmc_correct": benchmark_answers_match(dataset_name, mcmc_answer, answer),
                 "mcmc_tokens": len(mcmc_ids),
                 "mcmc_seconds": mcmc_seconds,
                 "mcmc_tokens_per_second": len(mcmc_ids) / max(mcmc_seconds, 1e-9),
@@ -632,7 +706,7 @@ def run_power_experiment(config: PowerExperimentConfig, experiment_name: str):
             "acceptance_ratio:",
             acceptance_ratio,
             "mcmc_correct:",
-            answers_match(mcmc_answer, answer),
+            benchmark_answers_match(dataset_name, mcmc_answer, answer),
             f"checkpoint -> {out_path} ({len(results)}/{len(shard)})",
         )
 
@@ -810,37 +884,78 @@ def run_speculative_power_sampling(
 
 @dataclass
 class SpeculativeExperimentConfig:
-    target_model_key: str = "qwen3_8b"
-    draft_model_key: str = "qwen3_small"
-    batch_idx: int = 0
+    target_model_key: str = "qwen_math"
+    draft_model_key: str | None = None
+    dataset: str = "math"
+    start_idx: int = 0
+    end_idx: int | None = None
     seed: int = 0
     alpha: float = 4.0
     block_size: int = 64
     mcmc_steps_per_block: int = 4
     max_new_tokens: int = 1024
     draft_temperature: float = 1.0
-    max_problems: int | None = 10
+    max_problems: int | None = None
     save_dir: str = "results"
-    data_path: str = "MATH500.json"
+    data_path: str | None = None
     use_cot: bool = True
 
 
 def run_speculative_experiment(config: SpeculativeExperimentConfig):
     set_seed(config.seed)
-    data_path = ensure_math500(config.data_path)
-    dataset = load_math500(data_path)
-    start, end, shard = select_shard(dataset, config.batch_idx, config.max_problems)
+    dataset_name = config.dataset.lower()
+    if dataset_name not in ("math", "gpqa"):
+        raise ValueError(f"Unsupported dataset: {config.dataset}")
+    if not config.target_model_key:
+        raise ValueError("SpeculativeExperimentConfig.target_model_key is required.")
+    if not config.draft_model_key:
+        raise ValueError("SpeculativeExperimentConfig.draft_model_key is required.")
+    if config.target_model_key not in MODEL_REPOS:
+        raise ValueError(f"Unknown target_model_key {config.target_model_key!r}; choose from {sorted(MODEL_REPOS)}")
+    if config.draft_model_key not in MODEL_REPOS:
+        raise ValueError(f"Unknown draft_model_key {config.draft_model_key!r}; choose from {sorted(MODEL_REPOS)}")
+    data_path, dataset = load_benchmark_dataset(dataset_name, config.data_path)
+    start, end, shard = select_range(dataset, config.start_idx, config.end_idx, config.max_problems)
 
     target_model_str = MODEL_REPOS[config.target_model_key]
     draft_model_str = MODEL_REPOS[config.draft_model_key]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"spec shard [{start}, {end}) target={target_model_str} draft={draft_model_str} device={device}")
+    print(
+        f"spec range [{start}, {end}) of {dataset_name.upper()} "
+        f"target={target_model_str} draft={draft_model_str} device={device} data={data_path}"
+    )
 
     out_dir = Path(config.save_dir) / "speculative_power"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Loading shared tokenizer...")
+    cfg_sig = config_signature(
+        config.max_new_tokens,
+        config.draft_temperature,
+        int(bool(config.use_cot)),
+        config.data_path,
+    )
+    csv_name = (
+        f"spec_power_{dataset_name}_{config.draft_model_key}_to_{config.target_model_key}_"
+        f"alpha{config.alpha}_block{config.block_size}_steps{config.mcmc_steps_per_block}_"
+        f"{range_slug(config.start_idx, config.end_idx)}_seed{config.seed}_cfg{cfg_sig}.csv"
+    )
+    out_path = out_dir / csv_name
+
+    results = load_existing_progress(out_path)
+    pickup = min(len(results), len(shard))
+    if pickup > 0:
+        print(f"[resume] {out_path} has {pickup} completed rows; continuing from index {start + pickup}")
+
+    print("Loading target tokenizer...")
     processor, tokenizer = load_text_processor(target_model_str)
+    print("Loading draft tokenizer and verifying compatibility...")
+    _, draft_tokenizer = load_text_processor(draft_model_str)
+    ensure_compatible_tokenizers(
+        tokenizer,
+        draft_tokenizer,
+        target_label=config.target_model_key,
+        draft_label=config.draft_model_key,
+    )
 
     print("Loading target model...")
     target_model = load_generation_model(target_model_str)
@@ -856,7 +971,7 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
     tokenizer_size = len(tokenizer)
     if target_vocab_size != draft_vocab_size:
         raise ValueError(
-            "Target and draft vocab sizes differ; use models with the same tokenizer/vocabulary. "
+            "Target and draft embedding sizes differ; use models with the same tokenizer/vocabulary. "
             f"target={target_vocab_size}, draft={draft_vocab_size}, tokenizer={tokenizer_size}"
         )
     if tokenizer_size > min(target_vocab_size, draft_vocab_size):
@@ -866,11 +981,19 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
         )
     print("Models loaded.")
 
-    results = []
-    for data in tqdm(shard, desc="MATH speculative power"):
-        question = data["prompt"]
-        answer = data["answer"]
-        input_text = format_prompt(question, config.target_model_key, tokenizer, config.use_cot)
+    for problem_idx, data in tqdm(
+        enumerate(shard[pickup:], start=start + pickup),
+        total=len(shard) - pickup,
+        desc=f"{dataset_name.upper()} speculative power",
+    ):
+        question, answer, input_text = prepare_benchmark_example(
+            dataset_name,
+            data,
+            config.target_model_key,
+            tokenizer,
+            config.use_cot,
+            example_seed=config.seed + problem_idx,
+        )
         model_inputs = encode_text_prompt(processor, tokenizer, input_text, device)
         context_ids = model_inputs["input_ids"]
 
@@ -891,16 +1014,17 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
         seconds = time.perf_counter() - t0
 
         completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        predicted_answer = parse_answer(completion)
+        predicted_answer = parse_benchmark_answer(dataset_name, completion)
         results.append(
             {
+                "dataset": dataset_name,
                 "question": question,
                 "correct_answer": answer,
-                "correct_answer_normalized": normalize_math_answer(answer),
+                "correct_answer_normalized": normalize_benchmark_answer(dataset_name, answer),
                 "spec_completion": completion,
                 "spec_answer": predicted_answer,
-                "spec_answer_normalized": normalize_math_answer(predicted_answer),
-                "spec_correct": answers_match(predicted_answer, answer),
+                "spec_answer_normalized": normalize_benchmark_answer(dataset_name, predicted_answer),
+                "spec_correct": benchmark_answers_match(dataset_name, predicted_answer, answer),
                 "spec_tokens": len(generated_ids),
                 "spec_seconds": seconds,
                 "spec_tokens_per_second": len(generated_ids) / max(seconds, 1e-9),
@@ -909,22 +1033,18 @@ def run_speculative_experiment(config: SpeculativeExperimentConfig):
                 "spec_acceptances": spec_stats["acceptances"],
             }
         )
+        pd.DataFrame(results).to_csv(out_path, index=False)
         print(
             "spec_acceptance_ratio:",
             spec_stats["acceptance_ratio"],
             "correct:",
-            answers_match(predicted_answer, answer),
+            benchmark_answers_match(dataset_name, predicted_answer, answer),
             "tokens/sec:",
             len(generated_ids) / max(seconds, 1e-9),
+            f"checkpoint -> {out_path} ({len(results)}/{len(shard)})",
         )
 
     df = pd.DataFrame(results)
-    csv_name = (
-        f"spec_power_{config.draft_model_key}_to_{config.target_model_key}_"
-        f"alpha{config.alpha}_block{config.block_size}_steps{config.mcmc_steps_per_block}_"
-        f"batch{config.batch_idx}_seed{config.seed}.csv"
-    )
-    out_path = out_dir / csv_name
     df.to_csv(out_path, index=False)
     metric_cols = [
         "spec_correct",
